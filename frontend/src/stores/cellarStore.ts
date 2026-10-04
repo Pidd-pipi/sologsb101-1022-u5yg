@@ -1,7 +1,13 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import {
+  enterCellar,
+  PendingReviewError,
+  SnapshotMismatchError,
+  unfreezeBatchIfNeeded
+} from '@/utils/versioning'
 import {
   CELLAR_NEAR_DAYS,
   CELLAR_STATE_FLOW,
@@ -16,6 +22,8 @@ import {
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
 import { round } from '@/utils/ratio'
+
+export { PendingReviewError, SnapshotMismatchError }
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -101,7 +109,7 @@ export const useCellarStore = defineStore('cellar', () => {
     return 'normal'
   }
 
-  /** 全部窖藏行：附带批次、香方与剩余天数 */
+  /** 全部窖藏行：附带批次、香方、剩余天数与入窖依据版本 */
   const rows = computed<CellarRow[]>(() =>
     cellars.value.map((cellar) => {
       const batch = batchMap.value[cellar.batchId]
@@ -110,6 +118,8 @@ export const useCellarStore = defineStore('cellar', () => {
         batchLabel: batchLabel(cellar.batchId),
         formulaName: batch ? formulaNameMap.value[batch.formulaId] ?? '香方已删除' : '香方已删除',
         quantity: batch?.quantity ?? 0,
+        formulaVersionNo: cellar.formulaVersionNo ?? batch?.formulaVersionNo ?? 0,
+        snapshotState: batch?.snapshotState ?? 'frozen',
         remainDays: daysBetween(todayIso(), cellar.endDate),
         agedDays: daysBetween(cellar.startDate, todayIso()),
         urgency: urgencyOf(cellar)
@@ -209,6 +219,12 @@ export const useCellarStore = defineStore('cellar', () => {
     return cellars.value.filter((cellar) => cellar.batchId === batchId)
   }
 
+  /**
+   * 登记入窖：入窖前强制比对批次快照与现行配比。
+   * - 快照待复核：抛 PendingReviewError；
+   * - 香料差异（增删 / 占比 / 角色）：抛 SnapshotMismatchError，调用方列出差异；
+   * - 一致：冻结批次原快照并写入窖藏，锚定依据版本。
+   */
   async function createCellar(payload: {
     batchId: string
     startDate: string
@@ -218,21 +234,27 @@ export const useCellarStore = defineStore('cellar', () => {
     container: CellarContainer
     state?: CellarState
   }): Promise<Cellar> {
-    return cellarTable.create(
-      {
-        batchId: payload.batchId,
-        startDate: payload.startDate,
-        endDate: payload.endDate,
-        temperatureC: round(payload.temperatureC, 1),
-        humidityPct: round(payload.humidityPct, 1),
-        container: payload.container,
-        state: payload.state ?? '窖藏中'
-      },
-      'cellar'
-    )
+    const { cellar } = await enterCellar({
+      id: createId('cellar'),
+      batchId: payload.batchId,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      temperatureC: round(payload.temperatureC, 1),
+      humidityPct: round(payload.humidityPct, 1),
+      container: payload.container,
+      state: payload.state ?? '窖藏中'
+    })
+    return cellar
   }
 
   async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
+    // 已存在的窖藏不允许改挂批次（冻结关系不可变），改批次需删除后重新入窖
+    if (patch.batchId !== undefined) {
+      const current = await db.cellars.get(id)
+      if (current && current.batchId !== patch.batchId) {
+        throw new Error('窖藏记录不能改挂批次；请删除后按新批次重新登记入窖')
+      }
+    }
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
@@ -270,7 +292,9 @@ export const useCellarStore = defineStore('cellar', () => {
   }
 
   async function removeCellar(id: string): Promise<void> {
+    const current = await db.cellars.get(id)
     await cellarTable.remove(id)
+    if (current) await unfreezeBatchIfNeeded(current.batchId)
     if (currentCellarId.value === id) currentCellarId.value = null
   }
 
@@ -278,6 +302,7 @@ export const useCellarStore = defineStore('cellar', () => {
     const ids = cellarsOfBatch(batchId).map((cellar) => cellar.id)
     if (ids.length === 0) return 0
     await cellarTable.bulkRemove(ids)
+    await unfreezeBatchIfNeeded(batchId)
     return ids.length
   }
 

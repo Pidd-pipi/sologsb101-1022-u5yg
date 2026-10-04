@@ -25,6 +25,12 @@ export interface Batch {
   snapshot: BatchSnapshotItem[]
   /** 快照固化时间戳 */
   snapshotAt: number
+  /** 快照状态：现行（随新方立即重算）/ 已冻结（入窖原方）/ 待复核（旧档缺快照） */
+  snapshotState: import('@/types/version').SnapshotState
+  /** 快照锚定的香方版本号；旧档缺失时为 0（待复核） */
+  formulaVersionNo: number
+  /** 批次在版本链上的留痕（重算 / 冻结 / 复核） */
+  versionTrail: import('@/types/version').BatchVersionTrail[]
   updatedAt: number
 }
 
@@ -40,6 +46,12 @@ export interface BatchRow {
   currentRatioTotal: number
   /** 快照配比合计 */
   snapshotRatioTotal: number
+  /** 快照状态标签 */
+  snapshotState: import('@/types/version').SnapshotState
+  /** 锚定的香方版本号 */
+  formulaVersionNo: number
+  /** 快照与当前配比是否一致（逐味比对） */
+  consistent: boolean
   /** 是否已进入窖藏 */
   cellared: boolean
   cellarState: string

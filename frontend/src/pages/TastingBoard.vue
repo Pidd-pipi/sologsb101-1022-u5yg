@@ -9,6 +9,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import VersionTag from '@/components/common/VersionTag.vue'
 import { DB_VERSION, readLastBackupAt, resetDatabase } from '@/utils/db'
 import {
   exportSnapshotJson,
@@ -93,8 +94,9 @@ const rules: FormRules = {
 const batchOptions = computed(() =>
   batchTable.rows.value.map((batch) => {
     const formula = formulaStore.formulaById(batch.formulaId)
+    const suffix = batch.snapshotState === 'pending_review' ? '（待复核，暂不计入均分）' : ''
     return {
-      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod}`,
+      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod}${suffix}`,
       value: batch.id
     }
   })
@@ -181,10 +183,17 @@ const rows = computed<TastingRow[]>(() =>
       batchLabel: batch ? `${batch.mixedAt} · ${batch.formingMethod} · ${batch.quantity} 支` : '批次已删除',
       formulaId: batch?.formulaId ?? null,
       formulaName: batch ? formulaStore.formulaName(batch.formulaId) : '香方已删除',
-      formingMethod: batch?.formingMethod ?? '—'
+      formingMethod: batch?.formingMethod ?? '—',
+      pending: batch?.snapshotState === 'pending_review',
+      formulaVersionNo: batch?.formulaVersionNo ?? 0,
+      snapshotState: batch?.snapshotState ?? 'frozen'
     }
   })
 )
+
+/** 待复核批次的评鉴：列出但不参与均分 */
+const pendingRows = computed(() => rows.value.filter((row) => row.pending))
+const countableRows = computed(() => rows.value.filter((row) => !row.pending))
 
 const filteredRows = computed<TastingRow[]>(() =>
   rows.value.filter((row) => {
@@ -200,10 +209,10 @@ const filteredRows = computed<TastingRow[]>(() =>
   })
 )
 
-/** 按香方聚合：同批次多次评鉴取均分并回写香方列表 */
+/** 按香方聚合：仅统计已复核批次的评鉴；待复核批次单列提示，不回写均分 */
 const aggregates = computed<ScoreAggregate[]>(() => {
   const grouped = new Map<string, Tasting[]>()
-  rows.value.forEach((row) => {
+  countableRows.value.forEach((row) => {
     if (!row.formulaId) return
     const list = grouped.get(row.formulaId) ?? []
     list.push(row.tasting)
@@ -218,9 +227,10 @@ const aggregates = computed<ScoreAggregate[]>(() => {
 })
 
 const filteredAverage = computed(() => {
-  if (filteredRows.value.length === 0) return 0
+  const list = filteredRows.value.filter((row) => !row.pending)
+  if (list.length === 0) return 0
   return round(
-    filteredRows.value.reduce((sum, row) => sum + row.tasting.smokeScore, 0) / filteredRows.value.length,
+    list.reduce((sum, row) => sum + row.tasting.smokeScore, 0) / list.length,
     1
   )
 })
@@ -235,7 +245,7 @@ const lastBackupAt = computed(() => readLastBackupAt())
 
 const countMap = computed<Record<string, number>>(() => {
   const map: Record<string, number> = {}
-  rows.value.forEach((row) => {
+  countableRows.value.forEach((row) => {
     if (!row.formulaId) return
     map[row.formulaId] = (map[row.formulaId] ?? 0) + 1
   })
@@ -408,7 +418,8 @@ function onlyFormula(formulaId: string): void {
       <div>
         <h2>品香评鉴与香方导出</h2>
         <p>
-          共 {{ rows.length }} 条评鉴 · 上品 {{ excellentCount }} 条 · 筛选均分 {{ filteredAverage || '—' }} ·
+          共 {{ rows.length }} 条评鉴 · 上品 {{ excellentCount }} 条 · 筛选均分 {{ filteredAverage || '—' }}
+          <template v-if="pendingRows.length > 0"> · {{ pendingRows.length }} 条待复核未计入</template> ·
           本地结构版本 v{{ DB_VERSION }}
         </p>
       </div>
@@ -429,10 +440,27 @@ function onlyFormula(formulaId: string): void {
       <StatBadge label="结构版本" :value="`v${DB_VERSION}`" icon="Coin" tone="primary" :hint="lastBackupAt ? `上次导出：${lastBackupAt}` : '尚未导出过备份'" />
     </div>
 
+    <el-alert
+      v-if="pendingRows.length > 0"
+      class="cellar-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`${pendingRows.length} 条评鉴来自缺快照的待复核批次，未自动并入均分`"
+    >
+      <template #default>
+        <ul class="alert-list">
+          <li v-for="row in pendingRows.slice(0, 5)" :key="row.tasting.id">
+            {{ row.formulaName }} · {{ row.tasting.tastedAt }} · 评分 {{ row.tasting.smokeScore }}（批次复核后计入）
+          </li>
+        </ul>
+      </template>
+    </el-alert>
+
     <div class="section-card">
       <div class="section-card__head">
-        <h3>香方品香均分（同批次多次评鉴取均分回写香方列表）</h3>
-        <span class="muted">导出文件包含香方、香料、配比、批次、窖藏与品香全部数据</span>
+        <h3>香方品香均分（待复核批次不并入，依据批次锚定版本）</h3>
+        <span class="muted">导出文件包含香方、香料、配比、版本链、批次、窖藏与品香全部数据</span>
       </div>
       <div v-if="aggregates.length === 0" class="muted">暂无品香评鉴数据，录入第一条后这里会显示均分。</div>
       <el-table v-else :data="aggregates" size="small" row-key="formulaId">
@@ -491,10 +519,18 @@ function onlyFormula(formulaId: string): void {
       </div>
 
       <el-table v-else :data="filteredRows" row-key="tasting.id" stripe>
-        <el-table-column label="香方 / 批次" min-width="200">
+        <el-table-column label="香方 / 批次" min-width="220">
           <template #default="{ row }: { row: TastingRow }">
             <div class="cell-main">{{ row.formulaName }}</div>
             <div class="cell-sub muted">{{ row.batchLabel }}</div>
+            <VersionTag
+              :version-no="row.formulaVersionNo"
+              :state="row.snapshotState"
+              style="margin-top: 2px"
+            />
+            <el-tag v-if="row.pending" type="danger" size="small" effect="plain" round style="margin-left: 6px">
+              待复核 · 不计入均分
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="品鉴日期" prop="tasting.tastedAt" width="120" />
@@ -514,10 +550,15 @@ function onlyFormula(formulaId: string): void {
             <GradeTag :score="row.tasting.smokeScore" plain size="small" />
           </template>
         </el-table-column>
-        <el-table-column label="同方均分" width="120">
+        <el-table-column label="同方均分" min-width="130">
           <template #default="{ row }: { row: TastingRow }">
-            <span class="mono">{{ row.formulaId ? formulaAverage(row.formulaId) ?? '—' : '—' }}</span>
-            <span class="cell-sub muted"> · {{ row.formulaId ? countMap[row.formulaId] ?? 0 : 0 }} 次</span>
+            <template v-if="row.pending">
+              <el-tag type="danger" size="small" effect="plain" round>待复核不计入</el-tag>
+            </template>
+            <template v-else>
+              <span class="mono">{{ row.formulaId ? formulaAverage(row.formulaId) ?? '—' : '—' }}</span>
+              <span class="cell-sub muted"> · {{ row.formulaId ? countMap[row.formulaId] ?? 0 : 0 }} 次</span>
+            </template>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="160" fixed="right">

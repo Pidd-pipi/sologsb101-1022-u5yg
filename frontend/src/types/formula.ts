@@ -17,6 +17,10 @@ export interface Formula {
   totalRatio: number
   /** 配方状态：草稿/在用/停用 */
   state: FormulaState
+  /** 当前版本号，香方/配比/批次/窖藏共用同一条版本链 */
+  versionNo: number
+  /** 乐观并发修订号：香方或配比每次改动都自增，用于多页/多标签页冲突检测 */
+  rev: number
   updatedAt: number
 }
 
@@ -40,6 +44,10 @@ export interface FormulaCard {
   /** 同香方全部品香均分，无评鉴时为 null */
   averageScore: number | null
   batchCount: number
+  /** 待复核（旧档缺快照）批次数 */
+  pendingBatchCount: number
+  /** 纳入均分的批次对应评鉴数；待复核批次的评鉴不自动并入 */
+  scoreCount: number
   /** 配比合计与 100 的偏差 */
   ratioGap: number
 }

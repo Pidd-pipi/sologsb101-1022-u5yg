@@ -18,6 +18,8 @@ export interface Cellar {
   container: CellarContainer
   /** 状态：窖藏中/已出窖 */
   state: CellarState
+  /** 入窖时锚定的香方版本号（冻结点），用于台账与导出标注依据版本 */
+  formulaVersionNo: number
   updatedAt: number
 }
 
@@ -41,6 +43,10 @@ export interface CellarRow {
   batchLabel: string
   formulaName: string
   quantity: number
+  /** 入窖依据的香方版本号 */
+  formulaVersionNo: number
+  /** 批次快照状态（已入窖的应为冻结态） */
+  snapshotState: import('@/types/version').SnapshotState
   /** 距计划出窖的天数（正数=剩余，负数=已逾期） */
   remainDays: number
   /** 已窖藏天数 */

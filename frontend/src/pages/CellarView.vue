@@ -7,10 +7,11 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
-import { useCellarStore, parseDate } from '@/stores/cellarStore'
+import { useCellarStore, parseDate, PendingReviewError, SnapshotMismatchError } from '@/stores/cellarStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { useProportion } from '@/hooks/useProportion'
+import { previewCellarCheck } from '@/utils/versioning'
+import VersionTag from '@/components/common/VersionTag.vue'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
 import {
@@ -26,6 +27,7 @@ import {
 } from '@/types/cellar'
 import type { Batch, FormingMethod } from '@/types/batch'
 import type { Proportion } from '@/types/proportion'
+import type { SnapshotDiffItem } from '@/types/version'
 
 const route = useRoute()
 const router = useRouter()
@@ -98,17 +100,31 @@ const rules: FormRules = {
   ]
 }
 
-/** 入窖表单所选批次对应的香方，用于校验该方配比是否已平衡 */
-const watchedFormulaId = computed(() => {
-  const batch = batchTable.rows.value.find((item) => item.id === form.batchId)
-  return batch?.formulaId ?? null
+/** 入窖表单所选批次的快照比对（入窖前强制校验：不一致即拒绝并列出香料差异） */
+const entryCheck = ref<{ pending: boolean; consistent: boolean; changedCount: number; diffs: SnapshotDiffItem[] }>({
+  pending: false,
+  consistent: true,
+  changedCount: 0,
+  diffs: []
 })
-const {
-  checkLevel: ratioLevel,
-  checkMessage: ratioMessage,
-  total: ratioTotal,
-  rows: ratioRows
-} = useProportion({ formulaId: watchedFormulaId })
+
+watch(
+  () => form.batchId,
+  async (batchId) => {
+    if (!batchId) {
+      entryCheck.value = { pending: false, consistent: true, changedCount: 0, diffs: [] }
+      return
+    }
+    const result = await previewCellarCheck(batchId)
+    entryCheck.value = {
+      pending: result.pending,
+      consistent: result.check.consistent,
+      changedCount: result.check.changedCount,
+      diffs: result.check.diffs.filter((diff) => diff.kind !== 'same')
+    }
+  },
+  { immediate: true }
+)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: cellarStore.filter.keyword,
@@ -173,8 +189,10 @@ const availableBatches = computed(() =>
 const batchOptions = computed(() =>
   availableBatches.value.map((batch) => {
     const formula = formulaStore.formulaById(batch.formulaId)
+    const suffix =
+      batch.snapshotState === 'pending_review' ? ' · 待复核不可入窖' : ''
     return {
-      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod} · ${batch.quantity} 支`,
+      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod} · ${batch.quantity} 支${suffix}`,
       value: batch.id
     }
   })
@@ -274,19 +292,45 @@ async function submitForm(): Promise<void> {
         state: form.state
       })
       ElMessage.success('窖藏环境记录已更新')
+      dialogVisible.value = false
     } else {
-      await cellarStore.createCellar({
-        batchId: form.batchId,
-        startDate: form.startDate,
-        endDate: form.endDate,
-        temperatureC: form.temperatureC,
-        humidityPct: form.humidityPct,
-        container: form.container,
-        state: form.state
-      })
-      ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+      try {
+        const cellar = await cellarStore.createCellar({
+          batchId: form.batchId,
+          startDate: form.startDate,
+          endDate: form.endDate,
+          temperatureC: form.temperatureC,
+          humidityPct: form.humidityPct,
+          container: form.container,
+          state: form.state
+        })
+        ElMessage.success(`已登记窖藏并冻结批次原快照，入窖依据版本 v${cellar.formulaVersionNo}`)
+        dialogVisible.value = false
+      } catch (err) {
+        if (err instanceof PendingReviewError) {
+          ElMessageBox.alert(
+            '该批次缺少配比快照，处于待复核状态。请到「和香批次」页按现行配比完成人工复核后再入窖；复核前其品香不并入均分。',
+            '已拒绝入窖：批次待复核',
+            { type: 'error', confirmButtonText: '知道了' }
+          )
+        } else if (err instanceof SnapshotMismatchError) {
+          const lines = err.diffs
+            .filter((diff) => diff.kind !== 'same')
+            .map((diff) => {
+              if (diff.kind === 'removed') return `· ${diff.materialName}（${diff.role}）：快照 ${diff.snapshotRatio}%，现行方已移除`
+              if (diff.kind === 'added') return `· ${diff.materialName}（${diff.role}）：快照无此味，现行方新增 ${diff.currentRatio}%`
+              return `· ${diff.materialName}（${diff.role}）：快照 ${diff.snapshotRatio}% → 现行 ${diff.currentRatio}%（${(diff.delta ?? 0) > 0 ? '+' : ''}${diff.delta}%）`
+            })
+          ElMessageBox.alert(
+            `入窖前比对发现 ${err.diffs.filter((diff) => diff.kind !== 'same').length} 处香料差异：\n${lines.join('\n')}\n\n请改回和香时版本，或先到批次页核对后再登记入窖。`,
+            '已拒绝入窖：快照与现行配比不一致',
+            { type: 'error', confirmButtonText: '知道了' }
+          )
+        } else {
+          ElMessage.error(err instanceof Error ? err.message : '入窖登记失败')
+        }
+      }
     }
-    dialogVisible.value = false
   } finally {
     submitting.value = false
   }
@@ -344,6 +388,11 @@ async function goTasting(row: CellarRow): Promise<void> {
 
 const formingText = (batchId: string): FormingMethod | '—' =>
   batchTable.rows.value.find((batch) => batch.id === batchId)?.formingMethod ?? '—'
+
+function batchDisabled(batchId: string): boolean {
+  if (editingId.value) return false
+  return batchTable.rows.value.find((batch) => batch.id === batchId)?.snapshotState === 'pending_review'
+}
 </script>
 
 <template>
@@ -431,13 +480,14 @@ const formingText = (batchId: string): FormingMethod | '—' =>
       </div>
 
       <el-table v-else :data="rows" row-key="cellar.id" stripe>
-        <el-table-column label="批次 / 香方" min-width="210">
+        <el-table-column label="批次 / 香方" min-width="230">
           <template #default="{ row }: { row: CellarRow }">
             <div class="cell-main">{{ row.formulaName }}</div>
             <div class="cell-sub muted">
               {{ formingText(row.cellar.batchId) }} · {{ row.quantity }} 支 · 配比
               {{ batchFormulaMaterialCount(row.cellar.batchId) }} 味
             </div>
+            <VersionTag :version-no="row.formulaVersionNo" state="frozen" />
           </template>
         </el-table-column>
         <el-table-column label="窖藏天数" width="150">
@@ -522,8 +572,20 @@ const formingText = (batchId: string): FormingMethod | '—' =>
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑窖藏记录' : '登记窖藏批次'" width="580px" append-to-body>
       <el-form ref="formRef" :model="form" :rules="rules" label-width="112px">
         <el-form-item label="和香批次" prop="batchId">
-          <el-select v-model="form.batchId" filterable placeholder="选择未入窖的批次" style="width: 100%">
-            <el-option v-for="item in batchOptions" :key="item.value" :label="item.label" :value="item.value" />
+          <el-select
+            v-model="form.batchId"
+            filterable
+            placeholder="选择未入窖的批次"
+            style="width: 100%"
+            :disabled="Boolean(editingId)"
+          >
+            <el-option
+              v-for="item in batchOptions"
+              :key="item.value"
+              :label="item.label"
+              :value="item.value"
+              :disabled="batchDisabled(item.value)"
+            />
           </el-select>
         </el-form-item>
         <el-form-item label="入窖日期" prop="startDate">
@@ -563,19 +625,50 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           </el-select>
         </el-form-item>
         <el-alert
-          v-if="watchedFormulaId"
+          v-if="form.batchId && !editingId"
           class="ratio-alert"
-          :type="ratioLevel === 'ok' ? 'success' : ratioLevel === 'warn' ? 'warning' : 'error'"
+          :type="entryCheck.pending ? 'error' : entryCheck.consistent ? 'success' : 'error'"
           :closable="false"
           show-icon
-          :title="`该批次所属香方配比合计：${ratioTotal}%（${ratioRows.length} 味）`"
-          :description="ratioMessage"
-        />
+          :title="
+            entryCheck.pending
+              ? '批次待复核，不能入窖'
+              : entryCheck.consistent
+                ? '快照与现行配比一致，可以入窖（入窖即冻结原快照）'
+                : `入窖前比对不一致：${entryCheck.changedCount} 处香料差异，已阻止入窖`
+          "
+        >
+          <template #default>
+            <div v-if="entryCheck.pending" class="cell-sub">
+              该批次为旧档缺快照批次，请到「和香批次」页按现行配比人工复核；复核前品香不自动并入均分。
+            </div>
+            <div v-else-if="!entryCheck.consistent" class="diff-list">
+              <div v-for="diff in entryCheck.diffs" :key="diff.materialId" class="diff-line">
+                <template v-if="diff.kind === 'removed'">
+                  {{ diff.materialName }}：快照 {{ diff.snapshotRatio }}%，现行方已移除
+                </template>
+                <template v-else-if="diff.kind === 'added'">
+                  {{ diff.materialName }}：现行方新增 {{ diff.currentRatio }}%
+                </template>
+                <template v-else>
+                  {{ diff.materialName }}：{{ diff.snapshotRatio }}% → {{ diff.currentRatio }}%
+                </template>
+              </div>
+            </div>
+            <div v-else class="cell-sub">入窖后该批次锚定当前版本，改方不会影响已入窖批次的原快照。</div>
+          </template>
+        </el-alert>
+        <el-alert v-else-if="editingId" class="ratio-alert" type="info" :closable="false" show-icon title="窖藏记录不能改挂批次，如需换批次请删除后重新登记入窖" />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存修改' : '登记入窖' }}
+        <el-button
+          type="primary"
+          :loading="submitting"
+          :disabled="!editingId && (entryCheck.pending || !entryCheck.consistent)"
+          @click="submitForm"
+        >
+          {{ editingId ? '保存修改' : '校验一致并登记入窖' }}
         </el-button>
       </template>
     </el-dialog>
@@ -621,5 +714,17 @@ const formingText = (batchId: string): FormingMethod | '—' =>
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.diff-line {
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

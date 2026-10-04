@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { applyProportionChange } from '@/utils/versioning'
 import {
   createEmptyProportionFilter,
   PROPORTION_ROLES,
@@ -169,6 +170,10 @@ export const useProportionStore = defineStore('proportion', () => {
     return sortMode.value === 'role' ? sortByRoleWeight(list) : [...list].sort((a, b) => a.seq - b.seq)
   }
 
+  /**
+   * 以下写方法统一走版本链事务（见 useProportion 的页面入口）：
+   * 改配比会追加版本、重算未入窖批次快照，并对过期 rev 报冲突留草稿。
+   */
   async function createProportion(payload: {
     formulaId: string
     materialId: string
@@ -178,18 +183,28 @@ export const useProportionStore = defineStore('proportion', () => {
     seq?: number
   }): Promise<Proportion> {
     const list = proportionsByFormula(payload.formulaId)
+    const seq = payload.seq ?? (list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1)
+    const now = Date.now()
+    const id = `${'prop'}_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`
     try {
-      return await proportionTable.create(
-        {
-          formulaId: payload.formulaId,
-          materialId: payload.materialId,
-          ratio: round(payload.ratio, 2),
-          role: payload.role,
-          note: payload.note,
-          seq: payload.seq ?? (list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1)
-        },
-        'prop'
-      )
+      await applyProportionChange({
+        formulaId: payload.formulaId,
+        baseRev: (await db.formulas.get(payload.formulaId))?.rev ?? 1,
+        source: '配比编排',
+        mutate: async (tx) => {
+          await tx.table<Proportion>('proportions').put({
+            id,
+            formulaId: payload.formulaId,
+            materialId: payload.materialId,
+            ratio: round(payload.ratio, 2),
+            role: payload.role,
+            note: payload.note,
+            seq,
+            updatedAt: now
+          })
+        }
+      })
+      return (await db.proportions.get(id)) as Proportion
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : '新增配比失败'
       throw err
@@ -197,20 +212,47 @@ export const useProportionStore = defineStore('proportion', () => {
   }
 
   async function updateProportion(id: string, patch: Partial<Proportion>): Promise<void> {
-    await proportionTable.update(id, patch)
+    const existing = await db.proportions.get(id)
+    if (!existing) return
+    const formula = await db.formulas.get(existing.formulaId)
+    await applyProportionChange({
+      formulaId: existing.formulaId,
+      baseRev: formula?.rev ?? 1,
+      source: '配比编排',
+      mutate: async (tx) => {
+        await tx.table<Proportion>('proportions').update(id, { ...patch, updatedAt: Date.now() })
+      }
+    })
   }
 
   async function removeProportion(id: string): Promise<void> {
-    await proportionTable.remove(id)
+    const existing = await db.proportions.get(id)
+    if (!existing) return
+    const formula = await db.formulas.get(existing.formulaId)
+    await applyProportionChange({
+      formulaId: existing.formulaId,
+      baseRev: formula?.rev ?? 1,
+      source: '配比编排',
+      mutate: async (tx) => {
+        await tx.table<Proportion>('proportions').delete(id)
+      }
+    })
     selectedIds.value = selectedIds.value.filter((item) => item !== id)
   }
 
-  /** 清空某香方的全部配比，并重排 seq */
+  /** 清空某香方的全部配比（版本链推进，未入窖批次快照同步重算） */
   async function clearFormulaProportions(formulaId: string): Promise<number> {
     const ids = proportionsByFormula(formulaId).map((item) => item.id)
     if (ids.length === 0) return 0
-    await proportionTable.bulkRemove(ids)
-    await db.formulas.update(formulaId, { totalRatio: 0, updatedAt: Date.now() })
+    const formula = await db.formulas.get(formulaId)
+    await applyProportionChange({
+      formulaId,
+      baseRev: formula?.rev ?? 1,
+      source: '配比编排-清空',
+      mutate: async (tx) => {
+        await tx.table<Proportion>('proportions').bulkDelete(ids)
+      }
+    })
     return ids.length
   }
 

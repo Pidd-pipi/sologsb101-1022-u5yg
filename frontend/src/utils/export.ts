@@ -21,8 +21,9 @@ import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { FormulaVersion } from '@/types/version'
 
-/** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
+/** 单方香方导出文件结构：一个香方 + 其配比与版本链 + 派生批次、窖藏、品香 */
 export interface FormulaExportPayload {
   app: 'gbincense'
   kind: 'formula'
@@ -33,6 +34,17 @@ export interface FormulaExportPayload {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  /** 该香方的版本链 */
+  formulaVersions: FormulaVersion[]
+  /** 台账依据：当前版本号、待复核批次数、各窖藏锚定版本 */
+  ledger: {
+    currentVersionNo: number
+    pendingBatchCount: number
+    frozenBatchCount: number
+    /** 品香均分计入的批次 id（待复核批次不在其中） */
+    scoreBatchIds: string[]
+    exportedBy: 'formula-ledger'
+  }
   /** 导出时一并携带被引用的香料主档，便于跨设备还原 */
   materials: Material[]
 }
@@ -84,8 +96,10 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
     batchIds.length > 0 ? db.tastings.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([])
   ])
   const materialIds = Array.from(new Set(proportions.map((item) => item.materialId)))
-  const materials =
-    materialIds.length > 0 ? await db.materials.where('id').anyOf(materialIds).toArray() : []
+  const [materials, formulaVersions] = await Promise.all([
+    materialIds.length > 0 ? db.materials.where('id').anyOf(materialIds).toArray() : Promise.resolve([]),
+    db.formulaVersions.where('formulaId').equals(formulaId).toArray()
+  ])
   return {
     app: 'gbincense',
     kind: 'formula',
@@ -96,6 +110,14 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
     batches,
     cellars,
     tastings,
+    formulaVersions: formulaVersions.sort((a, b) => a.versionNo - b.versionNo),
+    ledger: {
+      currentVersionNo: formula.versionNo,
+      pendingBatchCount: batches.filter((batch) => batch.snapshotState === 'pending_review').length,
+      frozenBatchCount: batches.filter((batch) => batch.snapshotState === 'frozen').length,
+      scoreBatchIds: batches.filter((batch) => batch.snapshotState !== 'pending_review').map((batch) => batch.id),
+      exportedBy: 'formula-ledger'
+    },
     materials
   }
 }
@@ -151,7 +173,9 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       proportions: snapshot.proportions.length,
       batches: snapshot.batches.length,
       cellars: snapshot.cellars.length,
-      tastings: snapshot.tastings.length
+      tastings: snapshot.tastings.length,
+      formulaVersions: snapshot.formulaVersions.length,
+      conflictDrafts: snapshot.conflictDrafts.length
     }
   }
 }
@@ -183,6 +207,8 @@ function parseFormula(input: unknown, errors: string[]): Formula | null {
     createdAt,
     totalRatio,
     state,
+    versionNo: asNumber(input.versionNo, 1) || 1,
+    rev: asNumber(input.rev, 1) || 1,
     updatedAt: asNumber(input.updatedAt, Date.now())
   }
 }
@@ -292,6 +318,15 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       errors.push(`batches[${index}] formingMethod 取值非法：${raw.formingMethod}`)
       return
     }
+    const snapshot = Array.isArray(raw.snapshot)
+      ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
+          materialId: asString(item.materialId),
+          materialName: asString(item.materialName, '未知香料'),
+          ratio: asNumber(item.ratio, 0),
+          role: asString(item.role, '君')
+        }))
+      : []
+    const snapshotState = raw.snapshotState === 'frozen' || raw.snapshotState === 'pending_review' ? raw.snapshotState : 'current'
     batches.push({
       id: asString(raw.id, createId('batch')),
       formulaId: formula.id,
@@ -299,15 +334,22 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       formingMethod: pickEnum<FormingMethod>(raw.formingMethod, FORMING_SET, '挤条'),
       quantity: asNumber(raw.quantity, 0),
       operator: asString(raw.operator),
-      snapshot: Array.isArray(raw.snapshot)
-        ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
-            materialId: asString(item.materialId),
-            materialName: asString(item.materialName, '未知香料'),
-            ratio: asNumber(item.ratio, 0),
-            role: asString(item.role, '君')
+      snapshot,
+      snapshotAt: asNumber(raw.snapshotAt, 0),
+      snapshotState: snapshot.length === 0 ? 'pending_review' : snapshotState,
+      formulaVersionNo: asNumber(raw.formulaVersionNo, 0),
+      versionTrail: Array.isArray(raw.versionTrail)
+        ? (raw.versionTrail as unknown[]).filter(isRecord).map((item) => ({
+            versionNo: asNumber(item.versionNo, 0),
+            state:
+              item.state === 'frozen' || item.state === 'current' || item.state === 'pending_review'
+                ? (item.state as import('@/types/version').SnapshotState)
+                : 'current',
+            reason: asString(item.reason, '档案补录') as import('@/types/version').VersionReason,
+            at: asNumber(item.at, Date.now()),
+            note: asString(item.note)
           }))
         : [],
-      snapshotAt: asNumber(raw.snapshotAt, 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -338,6 +380,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      formulaVersionNo: asNumber(raw.formulaVersionNo, 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -371,6 +414,34 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
     })
   })
 
+  const formulaVersions: FormulaVersion[] = []
+  const rawVersions = Array.isArray(input.formulaVersions) ? (input.formulaVersions as unknown[]) : []
+  rawVersions.forEach((raw, index) => {
+    if (!isRecord(raw)) {
+      errors.push(`formulaVersions[${index}] 不是合法对象`)
+      return
+    }
+    const snapshot = Array.isArray(raw.snapshot)
+      ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
+          materialId: asString(item.materialId),
+          materialName: asString(item.materialName, '未知香料'),
+          ratio: asNumber(item.ratio, 0),
+          role: asString(item.role, '君')
+        }))
+      : []
+    formulaVersions.push({
+      id: asString(raw.id, createId('fver')),
+      formulaId: formula.id,
+      versionNo: asNumber(raw.versionNo, index + 1) || index + 1,
+      snapshot,
+      totalRatio: asNumber(raw.totalRatio, 0),
+      reason: asString(raw.reason, '建方') as FormulaVersion['reason'],
+      operator: asString(raw.operator),
+      createdAt: asNumber(raw.createdAt, Date.now()),
+      updatedAt: asNumber(raw.updatedAt, Date.now())
+    })
+  })
+
   if (errors.length > 0) return { ok: false, errors, payload: null }
 
   return {
@@ -386,6 +457,24 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       batches,
       cellars,
       tastings,
+      formulaVersions,
+      ledger: isRecord(input.ledger)
+        ? {
+            currentVersionNo: asNumber(input.ledger.currentVersionNo, formula.versionNo),
+            pendingBatchCount: asNumber(input.ledger.pendingBatchCount, 0),
+            frozenBatchCount: asNumber(input.ledger.frozenBatchCount, 0),
+            scoreBatchIds: Array.isArray(input.ledger.scoreBatchIds)
+              ? (input.ledger.scoreBatchIds as unknown[]).map((item) => String(item))
+              : batches.filter((batch) => batch.snapshotState !== 'pending_review').map((batch) => batch.id),
+            exportedBy: 'formula-ledger'
+          }
+        : {
+            currentVersionNo: formula.versionNo,
+            pendingBatchCount: batches.filter((batch) => batch.snapshotState === 'pending_review').length,
+            frozenBatchCount: batches.filter((batch) => batch.snapshotState === 'frozen').length,
+            scoreBatchIds: batches.filter((batch) => batch.snapshotState !== 'pending_review').map((batch) => batch.id),
+            exportedBy: 'formula-ledger' as const
+          },
       materials
     }
   }
@@ -402,6 +491,9 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const snapshot = input as unknown as IncenseSnapshot
+  // 兼容 v2 导出：补齐版本链与冲突草稿表
+  if (!Array.isArray(snapshot.formulaVersions)) snapshot.formulaVersions = []
+  if (!Array.isArray(snapshot.conflictDrafts)) snapshot.conflictDrafts = []
   return { ok: true, errors: [], payload: snapshot }
 }
 
@@ -417,7 +509,7 @@ export async function importFormulaPayload(
   const batchIdMap = new Map<string, string>()
 
   const now = Date.now()
-  const formula: Formula = { ...payload.formula, id: formulaId, updatedAt: now }
+  const formula: Formula = { ...payload.formula, id: formulaId, updatedAt: now, rev: 1 }
   const materials: Material[] = payload.materials.map((material) => {
     const id = createId('material')
     materialIdMap.set(material.id, id)
@@ -440,17 +532,80 @@ export async function importFormulaPayload(
       formulaId,
       snapshot: batch.snapshot.map((item) => ({
         ...item,
-        materialId: materialIdMap.get(item.materialId) ?? item.materialId
+        materialId: materialIdMap.get(item.materialId) ?? item.materialId,
+        materialName:
+          materials.find((material) => material.id === (materialIdMap.get(item.materialId) ?? item.materialId))?.name ??
+          item.materialName
       })),
+      versionTrail: Array.isArray(batch.versionTrail)
+        ? batch.versionTrail
+        : [
+            {
+              versionNo: batch.formulaVersionNo || 1,
+              state: batch.snapshotState,
+              reason: '档案补录' as const,
+              at: batch.snapshotAt || now,
+              note: '随香方导入补登轨迹'
+            }
+          ],
       updatedAt: now
     }
   })
+
+  // 版本链重排为从 v1 起的连续编号，并改写快照中的香料 id；无版本链时以当前配比补 v1
+  const sortedVersions = [...payload.formulaVersions].sort((a, b) => a.versionNo - b.versionNo)
+  const remappedVersions: FormulaVersion[] = sortedVersions.map((version, index) => ({
+    ...version,
+    id: createId('fver'),
+    formulaId,
+    versionNo: index + 1,
+    snapshot: version.snapshot.map((item) => ({
+      ...item,
+      materialId: materialIdMap.get(item.materialId) ?? item.materialId
+    }))
+  }))
+  if (remappedVersions.length === 0 && proportions.length > 0) {
+    remappedVersions.push({
+      id: createId('fver'),
+      formulaId,
+      versionNo: 1,
+      snapshot: proportions.map((proportion) => ({
+        materialId: proportion.materialId,
+        materialName: materials.find((material) => material.id === proportion.materialId)?.name ?? '香料已删除',
+        ratio: proportion.ratio,
+        role: proportion.role
+      })),
+      totalRatio: formula.totalRatio,
+      reason: '建方',
+      operator: '',
+      createdAt: now,
+      updatedAt: now
+    })
+  }
+  // 批次锚定版本号映射（旧版本号 → 重排后版本号）
+  const versionNoMap = new Map<number, number>()
+  sortedVersions.forEach((version, index) => versionNoMap.set(version.versionNo, index + 1))
+  batches.forEach((batch) => {
+    if (batch.formulaVersionNo > 0) {
+      batch.formulaVersionNo = versionNoMap.get(batch.formulaVersionNo) ?? batch.formulaVersionNo
+    }
+    batch.versionTrail = (batch.versionTrail ?? []).map((trail) => ({
+      ...trail,
+      versionNo: trail.versionNo > 0 ? versionNoMap.get(trail.versionNo) ?? trail.versionNo : 0
+    }))
+  })
+  formula.versionNo = remappedVersions.length > 0 ? remappedVersions[remappedVersions.length - 1].versionNo : 1
+
   const cellars: Cellar[] = payload.cellars
     .filter((cellar) => batchIdMap.has(cellar.batchId))
     .map((cellar) => ({
       ...cellar,
       id: createId('cellar'),
       batchId: batchIdMap.get(cellar.batchId) as string,
+      formulaVersionNo:
+        batches.find((batch) => batch.id === batchIdMap.get(cellar.batchId))?.formulaVersionNo ??
+        cellar.formulaVersionNo ??
+        0,
       updatedAt: now
     }))
   const tastings: Tasting[] = payload.tastings
@@ -464,11 +619,20 @@ export async function importFormulaPayload(
 
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [
+      db.formulas,
+      db.materials,
+      db.proportions,
+      db.batches,
+      db.cellars,
+      db.tastings,
+      db.formulaVersions
+    ],
     async () => {
       await db.formulas.put(formula)
       if (materials.length > 0) await db.materials.bulkPut(materials)
       if (proportions.length > 0) await db.proportions.bulkPut(proportions)
+      if (remappedVersions.length > 0) await db.formulaVersions.bulkPut(remappedVersions)
       if (batches.length > 0) await db.batches.bulkPut(batches)
       if (cellars.length > 0) await db.cellars.bulkPut(cellars)
       if (tastings.length > 0) await db.tastings.bulkPut(tastings)
@@ -493,6 +657,7 @@ export async function importSnapshotPayload(
   overwrite: boolean
 ): Promise<Record<string, number>> {
   await importSnapshot(snapshot, overwrite)
+  await reconcileImportedVersionChain(snapshot)
   return {
     formulas: snapshot.formulas.length,
     materials: snapshot.materials.length,
@@ -501,6 +666,97 @@ export async function importSnapshotPayload(
     cellars: snapshot.cellars.length,
     tastings: snapshot.tastings.length
   }
+}
+
+/**
+ * 导入对账：为缺少版本字段的旧版记录补齐版本链。
+ * - 香方缺 versionNo / rev：按当前配比补 v1；
+ * - 批次缺快照：置为待复核；有快照但缺状态：未入窖现行 / 已入窖冻结；
+ * - 窖藏缺依据版本：取批次锚定版本。
+ */
+async function reconcileImportedVersionChain(snapshot: IncenseSnapshot): Promise<void> {
+  const now = Date.now()
+  const propsByFormula = new Map<string, Proportion[]>()
+  snapshot.proportions.forEach((proportion) => {
+    const list = propsByFormula.get(proportion.formulaId) ?? []
+    list.push(proportion)
+    propsByFormula.set(proportion.formulaId, list)
+  })
+  const cellaredBatchIds = new Set(snapshot.cellars.map((cellar) => cellar.batchId))
+  const materialNames = new Map(snapshot.materials.map((material) => [material.id, material.name]))
+  const existingVersions = new Set(snapshot.formulaVersions.map((version) => version.id))
+  const appendedVersions: FormulaVersion[] = []
+  let formulasChanged = false
+  let batchesChanged = false
+  let cellarsChanged = false
+
+  for (const formula of snapshot.formulas) {
+    if (typeof formula.versionNo !== 'number' || formula.versionNo < 1) formula.versionNo = 1
+    if (typeof formula.rev !== 'number' || formula.rev < 1) formula.rev = 1
+    const hasVersion = snapshot.formulaVersions.some((version) => version.formulaId === formula.id)
+    if (!hasVersion) {
+      const list = (propsByFormula.get(formula.id) ?? []).slice().sort((a, b) => a.seq - b.seq)
+      appendedVersions.push({
+        id: createId('fver'),
+        formulaId: formula.id,
+        versionNo: 1,
+        snapshot: list.map((proportion) => ({
+          materialId: proportion.materialId,
+          materialName: materialNames.get(proportion.materialId) ?? '香料已删除',
+          ratio: proportion.ratio,
+          role: proportion.role
+        })),
+        totalRatio: formula.totalRatio,
+        reason: '档案补录',
+        operator: '',
+        createdAt: now,
+        updatedAt: now
+      })
+    }
+    formulasChanged = true
+  }
+
+  for (const batch of snapshot.batches) {
+    if (!Array.isArray(batch.versionTrail)) batch.versionTrail = []
+    if (!Array.isArray(batch.snapshot) || batch.snapshot.length === 0) {
+      batch.snapshot = Array.isArray(batch.snapshot) ? batch.snapshot : []
+      batch.snapshotState = 'pending_review'
+      batch.formulaVersionNo = 0
+      batch.versionTrail.push({
+        versionNo: 0,
+        state: 'pending_review',
+        reason: '档案补录',
+        at: now,
+        note: '导入记录缺快照，置为待复核'
+      })
+    } else if (batch.snapshotState !== 'frozen' && batch.snapshotState !== 'current') {
+      batch.snapshotState = cellaredBatchIds.has(batch.id) ? 'frozen' : 'current'
+      batch.formulaVersionNo = batch.formulaVersionNo || 1
+    }
+    batchesChanged = true
+  }
+
+  for (const cellar of snapshot.cellars) {
+    if (typeof cellar.formulaVersionNo !== 'number' || cellar.formulaVersionNo < 1) {
+      const batch = snapshot.batches.find((item) => item.id === cellar.batchId)
+      cellar.formulaVersionNo = batch?.formulaVersionNo ?? 0
+      cellarsChanged = true
+    }
+  }
+
+  const newVersions = appendedVersions.filter((version) => !existingVersions.has(version.id))
+  if (newVersions.length === 0 && !formulasChanged && !batchesChanged && !cellarsChanged) return
+
+  await db.transaction(
+    'rw',
+    [db.formulas, db.batches, db.cellars, db.formulaVersions],
+    async () => {
+      if (newVersions.length > 0) await db.formulaVersions.bulkPut(newVersions)
+      if (batchesChanged) await db.batches.bulkPut(snapshot.batches)
+      if (cellarsChanged) await db.cellars.bulkPut(snapshot.cellars)
+      if (formulasChanged) await db.formulas.bulkPut(snapshot.formulas)
+    }
+  )
 }
 
 /** 读取用户选择的本地文件文本 */

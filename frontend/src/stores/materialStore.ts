@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { advanceAfterMaterialDeleted, refreshMaterialName } from '@/utils/versioning'
 import {
   createEmptyMaterialFilter,
   GRADE_WEIGHT,
@@ -176,7 +177,12 @@ export const useMaterialStore = defineStore('material', () => {
   }
 
   async function updateMaterial(id: string, patch: Partial<Material>): Promise<void> {
+    const previous = materialById(id)
     await materialTable.update(id, patch)
+    // 香料改名：刷新现行批次快照中的名字；冻结批次与历史版本保持原样
+    if (previous && typeof patch.name === 'string' && patch.name.trim() && patch.name.trim() !== previous.name) {
+      await refreshMaterialName(id, patch.name.trim())
+    }
   }
 
   /** 更新炮制方式并同步到字典 */
@@ -187,7 +193,7 @@ export const useMaterialStore = defineStore('material', () => {
     }
   }
 
-  /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */
+  /** 删除香料：级联删除引用它的配比，并为受影响香方推进版本链、重算未入窖批次快照 */
   async function removeMaterial(
     id: string
   ): Promise<{ proportions: number; formulaIds: string[] }> {
@@ -198,6 +204,7 @@ export const useMaterialStore = defineStore('material', () => {
       await db.proportions.bulkDelete(proportionIds)
       await db.materials.delete(id)
     })
+    await advanceAfterMaterialDeleted(formulaIds)
     return { proportions: proportionIds.length, formulaIds }
   }
 

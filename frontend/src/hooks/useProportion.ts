@@ -1,8 +1,9 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
-import { db } from '@/utils/db'
+import { db, createId } from '@/utils/db'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
+import { applyProportionChange, buildProportionDraftPayload } from '@/utils/versioning'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
 import {
@@ -120,7 +121,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   const checkLevel = computed(() => totals.value.level)
   const checkMessage = computed(() => totals.value.message)
 
-  /** 配比变化后把合计回写到香方，供香方台账与批次页读取 */
+  /** 配比变化后把合计回写到香方（版本链事务内已回写 totalRatio，这里仅兜底） */
   async function syncFormulaTotal(): Promise<void> {
     const id = formulaId.value
     if (!id) return
@@ -138,21 +139,54 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     return list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1
   }
 
+  /** 当前香方的修订号（乐观锁基线） */
+  function baseRevision(id: string): number {
+    return proportionRevision(id)
+  }
+
+  function proportionRevision(id: string): number {
+    return formulaStore.formulaById(id)?.rev ?? 1
+  }
+
   async function add(payload: ProportionFormPayload): Promise<Proportion> {
     const id = formulaId.value
     if (!id) throw new Error('请先选择香方')
     loading.value = true
     try {
-      const record = await proportionStore.createProportion({
+      const seq = nextSeq(id)
+      const recordId = createId('prop')
+      const draft = buildProportionDraftPayload([
+        {
+          proportionId: null,
+          materialId: payload.materialId,
+          materialName: materialStore.materialName(payload.materialId),
+          ratio: round(payload.ratio, 2),
+          role: payload.role,
+          note: payload.note.trim(),
+          seq,
+          deleted: false
+        }
+      ])
+      await applyProportionChange({
         formulaId: id,
-        materialId: payload.materialId,
-        ratio: round(payload.ratio, 2),
-        role: payload.role,
-        note: payload.note.trim(),
-        seq: nextSeq(id)
+        baseRev: baseRevision(id),
+        source: '配比编排页',
+        draftPayload: draft,
+        mutate: async (tx) => {
+          await tx.table<Proportion>('proportions').put({
+            id: recordId,
+            formulaId: id,
+            materialId: payload.materialId,
+            ratio: round(payload.ratio, 2),
+            role: payload.role,
+            note: payload.note.trim(),
+            seq,
+            updatedAt: Date.now()
+          })
+        }
       })
-      await syncFormulaTotal()
-      return record
+      const record = await db.proportions.get(recordId)
+      return record as Proportion
     } catch (err) {
       error.value = err instanceof Error ? err.message : '新增配比失败'
       throw err
@@ -164,13 +198,39 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<void> {
     loading.value = true
     try {
+      const formulaIdValue = formulaId.value
+      if (!formulaIdValue) throw new Error('请先选择香方')
+      const existing = await db.proportions.get(id)
+      if (!existing) throw new Error('配比记录不存在')
       const next: Partial<Proportion> = {}
       if (patch.materialId !== undefined) next.materialId = patch.materialId
       if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
       if (patch.role !== undefined) next.role = patch.role
       if (patch.note !== undefined) next.note = patch.note.trim()
-      await proportionStore.updateProportion(id, next)
-      await syncFormulaTotal()
+
+      const merged: Proportion = { ...existing, ...next }
+      const draft = buildProportionDraftPayload([
+        {
+          proportionId: id,
+          materialId: merged.materialId,
+          materialName: materialStore.materialName(merged.materialId),
+          ratio: round(merged.ratio, 2),
+          role: merged.role,
+          note: merged.note,
+          seq: merged.seq,
+          deleted: false
+        }
+      ])
+
+      await applyProportionChange({
+        formulaId: formulaIdValue,
+        baseRev: baseRevision(formulaIdValue),
+        source: '配比编排页',
+        draftPayload: draft,
+        mutate: async (tx) => {
+          await tx.table<Proportion>('proportions').update(id, { ...next, updatedAt: Date.now() })
+        }
+      })
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'
       throw err
@@ -180,15 +240,49 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   }
 
   async function remove(id: string): Promise<void> {
-    await proportionStore.removeProportion(id)
+    const formulaIdValue = formulaId.value
+    if (!formulaIdValue) return
+    const existing = await db.proportions.get(id)
+    const draft = existing
+      ? buildProportionDraftPayload([
+          {
+            proportionId: id,
+            materialId: existing.materialId,
+            materialName: materialStore.materialName(existing.materialId),
+            ratio: existing.ratio,
+            role: existing.role,
+            note: existing.note,
+            seq: existing.seq,
+            deleted: true
+          }
+        ])
+      : undefined
+    await applyProportionChange({
+      formulaId: formulaIdValue,
+      baseRev: baseRevision(formulaIdValue),
+      source: '配比编排页',
+      draftPayload: draft,
+      mutate: async (tx) => {
+        await tx.table<Proportion>('proportions').delete(id)
+      }
+    })
     await syncFormulaTotal()
   }
 
-  async function writeRatios(ids: string[], ratios: number[]): Promise<void> {
+  /** 等比缩放 / 归一化 / 批量改占比：一次事务内完成，只产生一个版本节点 */
+  async function writeRatiosGuarded(ids: string[], ratios: number[]): Promise<void> {
+    const formulaIdValue = formulaId.value
+    if (!formulaIdValue || ids.length === 0) return
     const now = Date.now()
-    await db.transaction('rw', db.proportions, async () => {
-      for (let index = 0; index < ids.length; index += 1) {
-        await db.proportions.update(ids[index], { ratio: round(ratios[index] ?? 0, 2), updatedAt: now })
+    await applyProportionChange({
+      formulaId: formulaIdValue,
+      baseRev: baseRevision(formulaIdValue),
+      source: '配比编排页-批量缩放',
+      mutate: async (tx) => {
+        const table = tx.table<Proportion>('proportions')
+        for (let index = 0; index < ids.length; index += 1) {
+          await table.update(ids[index], { ratio: round(ratios[index] ?? 0, 2), updatedAt: now })
+        }
       }
     })
   }
@@ -201,11 +295,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       factor === 1
         ? normalizeRatios(list.map((row) => row.ratio))
         : scaleRatios(list.map((row) => row.ratio), factor)
-    await writeRatios(
-      list.map((row) => row.proportion.id),
-      scaled
-    )
-    await syncFormulaTotal()
+    await writeRatiosGuarded(list.map((row) => row.proportion.id), scaled)
     return scaled.length
   }
 
@@ -213,21 +303,29 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     return rescale(factor)
   }
 
-  /** 按君臣佐使权重重排：写回 seq 并切换排序方式 */
+  /** 按君臣佐使权重重排：写回 seq 并切换排序方式（只动顺序，不产生新版本） */
   async function sortByRole(): Promise<void> {
     const sorted = sortByRoleWeight(rows.value.map((row) => row.proportion))
     await reorder(sorted.map((item) => item.id))
     proportionStore.setSortMode('role')
   }
 
-  /** 拖拽排序：按传入的 id 顺序回写 seq */
+  /** 拖拽排序：按传入的 id 顺序回写 seq（指纹不变，仅递增修订号） */
   async function reorder(orderedIds: string[]): Promise<void> {
     if (orderedIds.length === 0) return
     const seqMap = nextSeqMap(orderedIds)
     const now = Date.now()
-    await db.transaction('rw', db.proportions, async () => {
-      for (const id of orderedIds) {
-        await db.proportions.update(id, { seq: seqMap[id], updatedAt: now })
+    const formulaIdValue = formulaId.value
+    if (!formulaIdValue) return
+    await applyProportionChange({
+      formulaId: formulaIdValue,
+      baseRev: baseRevision(formulaIdValue),
+      source: '配比编排页-排序',
+      mutate: async (tx) => {
+        const table = tx.table<Proportion>('proportions')
+        for (const id of orderedIds) {
+          await table.update(id, { seq: seqMap[id], updatedAt: now })
+        }
       }
     })
     proportionStore.setSortMode('manual')
@@ -240,9 +338,17 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function clearFormula(): Promise<number> {
     const id = formulaId.value
     if (!id) return 0
-    const count = await proportionStore.clearFormulaProportions(id)
-    await syncFormulaTotal()
-    return count
+    const ids = proportionStore.proportionsByFormula(id).map((item) => item.id)
+    if (ids.length === 0) return 0
+    await applyProportionChange({
+      formulaId: id,
+      baseRev: baseRevision(id),
+      source: '配比编排页-清空',
+      mutate: async (tx) => {
+        await tx.table<Proportion>('proportions').bulkDelete(ids)
+      }
+    })
+    return ids.length
   }
 
   return {

@@ -10,7 +10,10 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useProportion, type ProportionRow } from '@/hooks/useProportion'
+import { RevisionConflictError } from '@/utils/versioning'
+import VersionTag from '@/components/common/VersionTag.vue'
 import { PROPORTION_ROLES, ROLE_COLOR, ROLE_HINT, type ProportionRole } from '@/types/proportion'
 import { MATERIAL_GRADES } from '@/types/material'
 import { formatPercent, round } from '@/utils/ratio'
@@ -20,6 +23,7 @@ const router = useRouter()
 const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
+const conflictStore = useConflictStore()
 const { rows, rolePreview, total, gap, checkLevel, checkMessage, add, update, remove, rescale, sortByRole, reorder, clearFormula } =
   useProportion()
 
@@ -29,6 +33,13 @@ const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const draggingId = ref<string | null>(null)
 const dragOverId = ref<string | null>(null)
+/** 正在查看的配比冲突草稿 id */
+const conflictDraftDrawer = ref<string | null>(null)
+
+const viewingDraft = computed(() => conflictStore.drafts.find((draft) => draft.id === conflictDraftDrawer.value) ?? null)
+const viewingDraftPayload = computed(() =>
+  viewingDraft.value ? conflictStore.parseProportionDraft(viewingDraft.value) : null
+)
 
 const form = reactive<{
   materialId: string
@@ -214,6 +225,16 @@ function openEdit(row: ProportionRow): void {
   dialogVisible.value = true
 }
 
+/** 统一处理版本链保存冲突：提示草稿已留，不再刷新弹窗 */
+function handleSaveError(err: unknown): boolean {
+  if (err instanceof RevisionConflictError) {
+    ElMessage.error('该香方配比已在另一页面被修改，您的修改已存为冲突草稿')
+    return true
+  }
+  ElMessage.error(err instanceof Error ? err.message : '保存失败')
+  return false
+}
+
 async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
@@ -233,6 +254,8 @@ async function submitForm(): Promise<void> {
       ElMessage.success('已加入配比，可继续调整占比')
     }
     dialogVisible.value = false
+  } catch (err) {
+    if (handleSaveError(err)) dialogVisible.value = false
   } finally {
     submitting.value = false
   }
@@ -240,13 +263,17 @@ async function submitForm(): Promise<void> {
 
 async function quickRatio(row: ProportionRow, value: number): Promise<void> {
   const next = round(value, 2)
-  if (next === row.ratio) return
-  await update(row.proportion.id, { ratio: next })
   if (next < 0 || next > 100) {
     ElMessage.warning('占比应在 0 ~ 100 之间')
     return
   }
-  ElMessage.success(`「${row.materialName}」占比改为 ${next}%`)
+  if (next === row.ratio) return
+  try {
+    await update(row.proportion.id, { ratio: next })
+    ElMessage.success(`「${row.materialName}」占比改为 ${next}%`)
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 async function removeRow(row: ProportionRow): Promise<void> {
@@ -256,8 +283,12 @@ async function removeRow(row: ProportionRow): Promise<void> {
     { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await remove(row.proportion.id)
-  ElMessage.success('配比已移除')
+  try {
+    await remove(row.proportion.id)
+    ElMessage.success('配比已移除')
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 async function doRescale(factor: number): Promise<void> {
@@ -265,10 +296,14 @@ async function doRescale(factor: number): Promise<void> {
     ElMessage.warning('当前香方还没有配比可缩放')
     return
   }
-  const count = await rescale(factor)
-  ElMessage.success(
-    factor === 1 ? `已按等比归一化 ${count} 条配比，合计校准为 100%` : `已按 ×${factor} 等比缩放 ${count} 条配比`
-  )
+  try {
+    const count = await rescale(factor)
+    ElMessage.success(
+      factor === 1 ? `已按等比归一化 ${count} 条配比，合计校准为 100%` : `已按 ×${factor} 等比缩放 ${count} 条配比`
+    )
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 async function doSortByRole(): Promise<void> {
@@ -276,8 +311,12 @@ async function doSortByRole(): Promise<void> {
     ElMessage.warning('当前香方还没有配比可排序')
     return
   }
-  await sortByRole()
-  ElMessage.success('已按君臣佐使权重（君 > 臣 > 佐 > 使）重排并写回编排顺序')
+  try {
+    await sortByRole()
+    ElMessage.success('已按君臣佐使权重（君 > 臣 > 佐 > 使）重排并写回编排顺序')
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 async function clearAll(): Promise<void> {
@@ -287,8 +326,12 @@ async function clearAll(): Promise<void> {
     { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  const count = await clearFormula()
-  ElMessage.success(`已清空 ${count} 条配比`)
+  try {
+    const count = await clearFormula()
+    ElMessage.success(`已清空 ${count} 条配比`)
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 function onDragStart(row: ProportionRow): void {
@@ -308,8 +351,12 @@ async function onDrop(target: ProportionRow): Promise<void> {
   const ordered = visibleRows.value.map((row) => row.proportion.id).filter((id) => id !== sourceId)
   const targetIndex = ordered.indexOf(target.proportion.id)
   ordered.splice(targetIndex, 0, sourceId)
-  await reorder(ordered)
-  ElMessage.success('君臣佐使编排顺序已按拖拽结果写回')
+  try {
+    await reorder(ordered)
+    ElMessage.success('君臣佐使编排顺序已按拖拽结果写回')
+  } catch (err) {
+    handleSaveError(err)
+  }
 }
 
 function onDragEnd(): void {
@@ -319,6 +366,20 @@ function onDragEnd(): void {
 
 const roleHint = (role: ProportionRole): string => ROLE_HINT[role]
 const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
+
+/** 当前香方未处理的冲突草稿 */
+const currentFormulaConflicts = computed(() =>
+  formulaStore.currentFormulaId ? conflictStore.draftsOfFormula(formulaStore.currentFormulaId) : []
+)
+
+async function discardCurrentDraft(draftId: string): Promise<void> {
+  await conflictStore.discard(draftId)
+  ElMessage.success('草稿已放弃')
+}
+
+async function purgeCurrentDraft(draftId: string): Promise<void> {
+  await conflictStore.purge(draftId)
+}
 </script>
 
 <template>
@@ -328,7 +389,13 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
         <h2>配比与君臣佐使编排</h2>
         <p>
           当前香方：{{ formulaStore.currentFormula ? formulaStore.currentFormula.name : '未选择' }} ·
-          {{ rows.length }} 味配比 · 合计 {{ totalPercent }} · 排序方式
+          {{ rows.length }} 味配比 · 合计 {{ totalPercent }} ·
+          <VersionTag
+            v-if="formulaStore.currentFormula"
+            :version-no="formulaStore.currentFormula.versionNo"
+            style="vertical-align: middle"
+          />
+          · 排序方式
           {{ proportionStore.sortMode === 'role' ? '君臣佐使权重' : '手动编排' }}
         </p>
       </div>
@@ -360,6 +427,35 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
       <StatBadge label="臣" :value="roleCounts['臣']" suffix="味" icon="PieChart" tone="warning" />
       <StatBadge label="佐 / 使" :value="`${roleCounts['佐']} / ${roleCounts['使']}`" icon="DataLine" tone="default" />
     </div>
+
+    <el-alert
+      v-if="currentFormulaConflicts.length > 0"
+      class="conflict-banner"
+      type="error"
+      show-icon
+      :closable="false"
+      :title="`「${formulaStore.currentFormula?.name ?? '当前香方'}」有 ${currentFormulaConflicts.length} 份并发冲突草稿`"
+    >
+      <template #default>
+        <div v-for="draft in currentFormulaConflicts" :key="draft.id" class="conflict-item">
+          <span>
+            {{ draft.kind === 'formula' ? '香方主档草稿（请到香方台账处理）' : '配比明细草稿' }} ·
+            基于 v{{ draft.baseRev }} 保存时已到 v{{ draft.latestRev }}
+          </span>
+          <el-button
+            v-if="draft.kind === 'proportion'"
+            size="small"
+            text
+            type="primary"
+            @click="conflictDraftDrawer = draft.id"
+          >
+            查看草稿内容
+          </el-button>
+          <el-button size="small" text @click="discardCurrentDraft(draft.id)">放弃</el-button>
+          <el-button size="small" text type="info" @click="purgeCurrentDraft(draft.id)">清除记录</el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <div class="check-strip" :class="`is-${checkLevel}`">
       <el-icon><Histogram /></el-icon>
@@ -480,7 +576,7 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
               :model-value="row.proportion.note"
               size="small"
               placeholder="炮制要点 / 替代香材"
-              @change="(value: string) => update(row.proportion.id, { note: value })"
+              @change="(value: string) => update(row.proportion.id, { note: value }).catch(handleSaveError)"
             />
           </span>
           <span class="drag-row__action">
@@ -520,10 +616,66 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
         </el-button>
       </template>
     </el-dialog>
+
+    <el-drawer
+      :model-value="conflictDraftDrawer !== null"
+      title="配比冲突草稿（后保存者）"
+      size="520px"
+      append-to-body
+      @update:model-value="(value: boolean) => !value && (conflictDraftDrawer = null)"
+    >
+      <template v-if="viewingDraft && viewingDraftPayload">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="`您基于 v${viewingDraft.baseRev} 编辑，保存时香方已到 v${viewingDraft.latestRev}`"
+          description="草稿不会覆盖现行配比；可对照下方内容在当前配比上手工调整后放弃草稿。"
+          class="draft-alert"
+        />
+        <el-table :data="viewingDraftPayload.items" size="small" row-key="materialId">
+          <el-table-column label="香料" prop="materialName" min-width="120" />
+          <el-table-column label="角色" prop="role" width="70" />
+          <el-table-column label="草稿占比" width="100">
+            <template #default="{ row }">
+              <span class="mono">{{ row.deleted ? '删除' : `${row.ratio}%` }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="备注" prop="note" min-width="120" />
+        </el-table>
+        <div class="draft-actions">
+          <el-button type="primary" @click="conflictDraftDrawer = null">知道了，去对照调整</el-button>
+          <el-button @click="discardCurrentDraft(viewingDraft.id)">放弃草稿</el-button>
+        </div>
+      </template>
+    </el-drawer>
   </div>
 </template>
 
 <style scoped>
+.conflict-banner {
+  margin-bottom: 16px;
+}
+
+.conflict-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.draft-alert {
+  margin-bottom: 12px;
+}
+
+.draft-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 .check-strip {
   display: flex;
   flex-wrap: wrap;

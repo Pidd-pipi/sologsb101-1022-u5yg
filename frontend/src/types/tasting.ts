@@ -55,13 +55,18 @@ export const SCORE_BAND_ICON: Record<ScoreBand, string> = {
   poor: 'WarningFilled'
 }
 
-/** 品香列表行：品香 + 批次 + 香方 */
+/** 品香列表行：品香 + 批次 + 香方 + 依据版本 */
 export interface TastingRow {
   tasting: Tasting
   batchLabel: string
   formulaId: string | null
   formulaName: string
   formingMethod: string
+  /** 批次是否待复核（待复核评鉴不并入均分） */
+  pending: boolean
+  /** 批次锚定的香方版本号（台账与导出标注依据版本） */
+  formulaVersionNo: number
+  snapshotState: import('@/types/version').SnapshotState
 }
 
 /** 某香方的品香均分聚合结果 */

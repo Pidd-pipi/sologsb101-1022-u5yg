@@ -2,13 +2,16 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Download, Edit, Histogram, Plus, Refresh, Upload } from '@element-plus/icons-vue'
+import { Download, Edit, Histogram, Plus, Refresh, Upload, WarningFilled } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import VersionTag from '@/components/common/VersionTag.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useProportionStore } from '@/stores/proportionStore'
+import { useConflictStore } from '@/stores/conflictStore'
+import { RevisionConflictError, updateFormulaGuarded } from '@/utils/versioning'
 import { exportFormulaJson, importFormulaPayload, readFileText, validateFormulaJson } from '@/utils/export'
 import { resetDatabase } from '@/utils/db'
 import { round } from '@/utils/ratio'
@@ -22,11 +25,13 @@ import {
   type ScentType,
   type UsageScene
 } from '@/types/formula'
+import type { FormulaDraftPayload } from '@/types/version'
 
 const route = useRoute()
 const router = useRouter()
 const formulaStore = useFormulaStore()
 const proportionStore = useProportionStore()
+const conflictStore = useConflictStore()
 
 const dialogVisible = ref(false)
 const importVisible = ref(false)
@@ -35,6 +40,10 @@ const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const importText = ref('')
 const importFileName = ref('')
+/** 打开香方编辑弹窗时的修订号基线，用于检测并发编辑 */
+const baseRev = ref(1)
+/** 弹窗打开后香方被其他页面 / 标签页改动时提示 */
+const staleWhileEditing = ref(false)
 
 const form = reactive<{
   name: string
@@ -141,18 +150,31 @@ function openCreate(): void {
   form.usage = '静室'
   form.state = '草稿'
   form.createdAt = new Date().toISOString().slice(0, 10)
+  staleWhileEditing.value = false
   dialogVisible.value = true
 }
 
 function openEdit(formula: Formula): void {
   editingId.value = formula.id
+  baseRev.value = formula.rev ?? 1
   form.name = formula.name
   form.scentType = formula.scentType
   form.usage = formula.usage
   form.state = formula.state
   form.createdAt = formula.createdAt
+  staleWhileEditing.value = false
   dialogVisible.value = true
 }
+
+/** 弹窗打开期间，其他页面 / 标签页先保存了同一香方：给出冲突提示 */
+watch(
+  () => (editingId.value ? formulaStore.formulaById(editingId.value)?.rev : undefined),
+  (rev) => {
+    if (dialogVisible.value && editingId.value && typeof rev === 'number' && rev !== baseRev.value) {
+      staleWhileEditing.value = true
+    }
+  }
+)
 
 async function submitForm(): Promise<void> {
   if (!formRef.value) return
@@ -161,12 +183,17 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await formulaStore.updateFormula(editingId.value, {
-        name: form.name.trim(),
-        scentType: form.scentType,
-        usage: form.usage,
-        state: form.state,
-        createdAt: form.createdAt
+      await updateFormulaGuarded({
+        formulaId: editingId.value,
+        baseRev: baseRev.value,
+        source: '香方台账页',
+        patch: {
+          name: form.name.trim(),
+          scentType: form.scentType,
+          usage: form.usage,
+          state: form.state,
+          createdAt: form.createdAt
+        }
       })
       ElMessage.success('香方已更新')
     } else {
@@ -180,9 +207,59 @@ async function submitForm(): Promise<void> {
       ElMessage.success(`已新建香方「${formula.name}」，请继续录入君臣佐使配比`)
     }
     dialogVisible.value = false
+    staleWhileEditing.value = false
+  } catch (err) {
+    if (err instanceof RevisionConflictError) {
+      ElMessage.error('该香方已在另一页面被修改，您的修改已存为冲突草稿')
+      dialogVisible.value = false
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : '保存失败')
+    }
   } finally {
     submitting.value = false
   }
+}
+
+/** 应用香方主档冲突草稿：把草稿内容回填到编辑弹窗 */
+function applyFormulaDraft(draftId: string): void {
+  const draft = conflictStore.drafts.find((item) => item.id === draftId)
+  if (!draft) return
+  const payload = conflictStore.parseFormulaDraft(draft) as FormulaDraftPayload | null
+  if (!payload) {
+    ElMessage.error('草稿内容无法解析')
+    return
+  }
+  editingId.value = draft.formulaId
+  baseRev.value = draft.latestRev
+  form.name = payload.name
+  form.scentType = payload.scentType as ScentType
+  form.usage = payload.usage as UsageScene
+  form.state = payload.state as FormulaState
+  form.createdAt = payload.createdAt
+  void conflictStore.discard(draftId)
+  staleWhileEditing.value = false
+  dialogVisible.value = true
+}
+
+/** 跳转到配比页处理配比冲突草稿 */
+function openProportionDraft(draftId: string): void {
+  const draft = conflictStore.drafts.find((item) => item.id === draftId)
+  if (!draft) return
+  formulaStore.setCurrentFormula(draft.formulaId)
+  void router.push('/proportions')
+}
+
+async function discardDraft(draftId: string): Promise<void> {
+  await conflictStore.discard(draftId)
+  ElMessage.success('冲突草稿已标记为处理')
+}
+
+async function purgeDraft(draftId: string): Promise<void> {
+  await conflictStore.purge(draftId)
+}
+
+function draftFormulaName(formulaId: string): string {
+  return formulaStore.formulaName(formulaId)
 }
 
 async function advanceState(formula: Formula): Promise<void> {
@@ -231,7 +308,7 @@ async function exportOne(formula: Formula): Promise<void> {
   try {
     const { fileName, counts } = await exportFormulaJson(formula.id)
     ElMessage.success(
-      `已导出 ${fileName}（配比 ${counts.proportions} 条 / 批次 ${counts.batches} 个 / 窖藏 ${counts.cellars} 条 / 品香 ${counts.tastings} 条）`
+      `已导出 ${fileName}（依据 v${formula.versionNo} · 配比 ${counts.proportions} 条 / 批次 ${counts.batches} 个 / 窖藏 ${counts.cellars} 条 / 品香 ${counts.tastings} 条，含完整版本链）`
     )
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : '导出失败')
@@ -311,6 +388,39 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
       </div>
     </div>
 
+    <el-alert
+      v-if="conflictStore.unresolvedCount > 0"
+      class="conflict-banner"
+      type="error"
+      show-icon
+      :closable="false"
+      :title="`有 ${conflictStore.unresolvedCount} 份并发编辑冲突草稿待处理（后保存者的修改未覆盖先保存者）`"
+    >
+      <template #default>
+        <div v-for="draft in conflictStore.unresolved" :key="draft.id" class="conflict-item">
+          <el-icon><WarningFilled /></el-icon>
+          <span class="conflict-item__name">
+            {{ draftFormulaName(draft.formulaId) }} · {{ draft.kind === 'formula' ? '香方主档草稿' : '配比明细草稿' }} ·
+            基于 v{{ draft.baseRev }} 保存时已到 v{{ draft.latestRev }}
+          </span>
+          <el-button
+            v-if="draft.kind === 'formula'"
+            size="small"
+            type="primary"
+            text
+            @click="applyFormulaDraft(draft.id)"
+          >
+            取出草稿编辑
+          </el-button>
+          <el-button v-else size="small" type="primary" text @click="openProportionDraft(draft.id)">
+            到配比页查看
+          </el-button>
+          <el-button size="small" text @click="discardDraft(draft.id)">放弃</el-button>
+          <el-button size="small" text type="info" @click="purgeDraft(draft.id)">清除记录</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <div class="stat-row">
       <StatBadge label="香方总数" :value="formulaStore.formulas.length" suffix="款" icon="Files" tone="primary" />
       <StatBadge label="在用香方" :value="formulaStore.inUseCount" suffix="款" icon="Histogram" tone="success" />
@@ -375,6 +485,7 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
           >
             {{ card.formula.state }}
           </el-tag>
+          <VersionTag :version-no="card.formula.versionNo" />
         </header>
 
         <div class="formula-card__badges">
@@ -387,12 +498,16 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
             size="small"
             icon="TrendCharts"
             tone="warning"
+            :hint="card.scoreCount > 0 ? `已纳入 ${card.scoreCount} 条评鉴` : '暂无可计入的评鉴'"
           />
         </div>
 
         <div class="formula-card__tags">
           <GradeTag v-if="card.latestScore !== null" :score="card.latestScore" label="最近品香" size="small" plain />
           <GradeTag v-else label="尚无品香" size="small" plain />
+          <el-tag v-if="card.pendingBatchCount > 0" type="danger" size="small" effect="plain" round>
+            {{ card.pendingBatchCount }} 个批次待复核，品香暂不计入均分
+          </el-tag>
           <span v-if="card.ratioGap !== 0" class="ratio-error">
             配比偏差 {{ card.ratioGap > 0 ? '+' : '' }}{{ card.ratioGap }}%
           </span>
@@ -430,6 +545,15 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
       append-to-body
     >
       <el-form ref="formRef" :model="form" :rules="rules" label-width="96px">
+        <el-alert
+          v-if="staleWhileEditing"
+          class="stale-alert"
+          type="error"
+          show-icon
+          :closable="false"
+          title="该香方在本窗口打开后已被另一页面 / 标签页修改"
+          description="继续保存会把您的内容存为冲突草稿，不会覆盖对方的修改；请先到香方台账查看冲突草稿。"
+        />
         <el-form-item label="香方名" prop="name">
           <el-input v-model="form.name" placeholder="如：静室安神线香" maxlength="30" show-word-limit />
         </el-form-item>
@@ -485,6 +609,27 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
 </template>
 
 <style scoped>
+.conflict-banner {
+  margin-bottom: 16px;
+}
+
+.conflict-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.conflict-item__name {
+  flex: 1 1 240px;
+}
+
+.stale-alert {
+  margin-bottom: 12px;
+}
+
 .formula-empty {
   margin-top: 16px;
 }

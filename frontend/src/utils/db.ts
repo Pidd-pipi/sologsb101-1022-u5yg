@@ -1,13 +1,14 @@
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type { Formula } from '@/types/formula'
 import type { Material } from '@/types/material'
 import type { Proportion } from '@/types/proportion'
-import type { Batch } from '@/types/batch'
+import type { Batch, BatchSnapshotItem } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { ConflictDraft, FormulaVersion } from '@/types/version'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -42,6 +43,10 @@ export interface IncenseSnapshot {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  /** 香方版本链 */
+  formulaVersions: FormulaVersion[]
+  /** 并发冲突草稿 */
+  conflictDrafts: ConflictDraft[]
 }
 
 export class IncenseDatabase extends Dexie {
@@ -51,6 +56,8 @@ export class IncenseDatabase extends Dexie {
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
   tastings!: Table<Tasting, string>
+  formulaVersions!: Table<FormulaVersion, string>
+  conflictDrafts!: Table<ConflictDraft, string>
 
   constructor() {
     super('gbincense')
@@ -64,7 +71,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -108,7 +115,187 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：香方 / 配比 / 批次 / 窖藏共用版本链，新增版本表与冲突草稿表，并为旧档补版本
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, versionNo, rev, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, snapshotState, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt',
+        formulaVersions: 'id, formulaId, versionNo, createdAt',
+        conflictDrafts: 'id, formulaId, kind, resolved, createdAt'
+      })
+      .upgrade(async (tx) => {
+        await migrateToVersionChain(tx)
+      })
   }
+}
+
+/**
+ * v3 迁移：为旧档补一条版本链。
+ * 1. 每款香方按当前配比生成 v1（旧档案补录）；
+ * 2. 批次快照非空：能逐味对上的锚定 v1；对不上的为该方追加一个和香固化版本并锚定之；
+ * 3. 已入窖批次冻结原快照，窖藏记录锚定其版本号；
+ * 4. 未入窖批次：快照非空的立即按当前配比重算为现行；缺快照的置为待复核，不自动并入均分。
+ */
+async function migrateToVersionChain(tx: Transaction): Promise<void> {
+  const now = Date.now()
+  const formulas = await tx.table<Formula>('formulas').toArray()
+  const proportions = await tx.table<Proportion>('proportions').toArray()
+  const materials = await tx.table<Material>('materials').toArray()
+  const batches = await tx.table<Batch>('batches').toArray()
+  const cellars = await tx.table<Cellar>('cellars').toArray()
+
+  const materialNameMap = new Map<string, string>()
+  materials.forEach((material) => materialNameMap.set(material.id, material.name))
+
+  const propsByFormula = new Map<string, Proportion[]>()
+  proportions.forEach((proportion) => {
+    const list = propsByFormula.get(proportion.formulaId) ?? []
+    list.push(proportion)
+    propsByFormula.set(proportion.formulaId, list)
+  })
+  const cellarsByBatch = new Map<string, Cellar[]>()
+  cellars.forEach((cellar) => {
+    const list = cellarsByBatch.get(cellar.batchId) ?? []
+    list.push(cellar)
+    cellarsByBatch.set(cellar.batchId, list)
+  })
+
+  const snapshotOf = (list: Proportion[]): BatchSnapshotItem[] =>
+    [...list]
+      .sort((a, b) => a.seq - b.seq)
+      .map((proportion) => ({
+        materialId: proportion.materialId,
+        materialName: materialNameMap.get(proportion.materialId) ?? proportion.materialId,
+        ratio: Math.round(proportion.ratio * 100) / 100,
+        role: proportion.role
+      }))
+
+  const fingerprintOf = (snapshot: BatchSnapshotItem[]): string =>
+    snapshot
+      .map((item) => `${item.materialId}:${Math.round(item.ratio * 100) / 100}:${item.role}`)
+      .sort()
+      .join('|')
+
+  const newVersions: FormulaVersion[] = []
+
+  for (const formula of formulas) {
+    const list = propsByFormula.get(formula.id) ?? []
+    const currentSnapshot = snapshotOf(list)
+    const currentTotal = Math.round(currentSnapshot.reduce((sum, item) => sum + item.ratio, 0) * 100) / 100
+
+    let nextNo = 1
+    const pushVersion = (snapshot: BatchSnapshotItem[], reason: FormulaVersion['reason'], createdAt: number): FormulaVersion => {
+      const version: FormulaVersion = {
+        id: createId('fver'),
+        formulaId: formula.id,
+        versionNo: nextNo,
+        snapshot,
+        totalRatio: Math.round(snapshot.reduce((sum, item) => sum + item.ratio, 0) * 100) / 100,
+        reason,
+        operator: '',
+        createdAt,
+        updatedAt: now
+      }
+      nextNo += 1
+      newVersions.push(version)
+      return version
+    }
+
+    // 1. 已入窖且快照与当前方不一致的批次：把原快照补为历史版本（相同指纹只补一个）
+    const currentFingerprint = fingerprintOf(currentSnapshot)
+    const historicalByFingerprint = new Map<string, FormulaVersion>()
+    for (const batch of batches.filter((item) => item.formulaId === formula.id)) {
+      if (!Array.isArray(batch.snapshot)) batch.snapshot = []
+      if (typeof batch.snapshotAt !== 'number') batch.snapshotAt = 0
+      batch.versionTrail = []
+      const isCellared = (cellarsByBatch.get(batch.id) ?? []).length > 0
+      if (!isCellared || batch.snapshot.length === 0) continue
+      const fingerprint = fingerprintOf(batch.snapshot)
+      if (fingerprint === currentFingerprint) continue
+      if (!historicalByFingerprint.has(fingerprint)) {
+        historicalByFingerprint.set(
+          fingerprint,
+          pushVersion(
+            batch.snapshot.map((item) => ({ ...item })),
+            '入窖冻结',
+            batch.snapshotAt || batch.updatedAt || now
+          )
+        )
+      }
+    }
+
+    // 2. 链尾补当前配比版本（旧档案补录）；没有历史版本时它就是 v1
+    const currentVersion = pushVersion(currentSnapshot, '档案补录', formula.updatedAt || now)
+
+    // 3. 逐批处理状态：缺快照待复核；已入窖冻结锚历史版本；未入窖立即按现行方重算
+    for (const batch of batches.filter((item) => item.formulaId === formula.id)) {
+      const isCellared = (cellarsByBatch.get(batch.id) ?? []).length > 0
+      if (batch.snapshot.length === 0) {
+        // 缺快照批次：先待复核，不自动并入均分；待人工复核后才锚定版本
+        batch.snapshotState = 'pending_review'
+        batch.formulaVersionNo = 0
+        batch.versionTrail.push({
+          versionNo: 0,
+          state: 'pending_review',
+          reason: '档案补录',
+          at: now,
+          note: '旧档批次缺少配比快照，已置为待复核'
+        })
+        continue
+      }
+
+      if (isCellared) {
+        const fingerprint = fingerprintOf(batch.snapshot)
+        const anchor =
+          fingerprint === currentFingerprint
+            ? currentVersion
+            : historicalByFingerprint.get(fingerprint) ?? currentVersion
+        // 已入窖：冻结原快照，锚定其依据版本
+        batch.snapshotState = 'frozen'
+        batch.formulaVersionNo = anchor.versionNo
+        batch.versionTrail.push({
+          versionNo: anchor.versionNo,
+          state: 'frozen',
+          reason: '入窖冻结',
+          at: batch.snapshotAt || now,
+          note: `旧档迁移：入窖批次冻结原快照 v${anchor.versionNo}`
+        })
+      } else {
+        // 未入窖：旧快照立即失效，按当前配比重算并锚定现行版本
+        batch.snapshot = currentSnapshot.map((item) => ({ ...item }))
+        batch.snapshotAt = now
+        batch.snapshotState = 'current'
+        batch.formulaVersionNo = currentVersion.versionNo
+        batch.versionTrail.push({
+          versionNo: currentVersion.versionNo,
+          state: 'current',
+          reason: '档案补录',
+          at: now,
+          note: `旧档迁移：未入窖批次快照按现行配比重算至 v${currentVersion.versionNo}`
+        })
+      }
+    }
+
+    // 香方当前版本指向链尾（即当前配比）
+    formula.versionNo = currentVersion.versionNo
+    formula.rev = 1
+    formula.totalRatio = currentTotal
+  }
+
+  // 窖藏锚定冻结批次的依据版本；待复核批次的窖藏保持 0 待人工处理
+  for (const cellar of cellars) {
+    const batch = batches.find((item) => item.id === cellar.batchId)
+    cellar.formulaVersionNo = batch?.formulaVersionNo ?? 0
+  }
+
+  await tx.table<FormulaVersion>('formulaVersions').bulkPut(newVersions)
+  await tx.table<Formula>('formulas').bulkPut(formulas)
+  await tx.table<Batch>('batches').bulkPut(batches)
+  await tx.table<Cellar>('cellars').bulkPut(cellars)
 }
 
 export const db = new IncenseDatabase()
@@ -123,7 +310,16 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [
+      db.formulas,
+      db.materials,
+      db.proportions,
+      db.batches,
+      db.cellars,
+      db.tastings,
+      db.formulaVersions,
+      db.conflictDrafts
+    ],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,7 +327,9 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.formulaVersions.clear(),
+        db.conflictDrafts.clear()
       ])
     }
   )
@@ -139,15 +337,17 @@ export async function clearAllTables(): Promise<void> {
 
 /** 各表记录数汇总，品香页与状态徽标消费 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, formulaVersions, conflictDrafts] = await Promise.all([
     db.formulas.count(),
     db.materials.count(),
     db.proportions.count(),
     db.batches.count(),
     db.cellars.count(),
-    db.tastings.count()
+    db.tastings.count(),
+    db.formulaVersions.count(),
+    db.conflictDrafts.count()
   ])
-  return { formulas, materials, proportions, batches, cellars, tastings }
+  return { formulas, materials, proportions, batches, cellars, tastings, formulaVersions, conflictDrafts }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -192,13 +392,15 @@ export function readLastBackupAt(): string | null {
 
 /** 组装本地全部数据的快照对象 */
 export async function exportSnapshot(): Promise<IncenseSnapshot> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, formulaVersions, conflictDrafts] = await Promise.all([
     db.formulas.toArray(),
     db.materials.toArray(),
     db.proportions.toArray(),
     db.batches.toArray(),
     db.cellars.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.formulaVersions.toArray(),
+    db.conflictDrafts.toArray()
   ])
   return {
     app: 'gbincense',
@@ -209,7 +411,9 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
     proportions,
     batches,
     cellars,
-    tastings
+    tastings,
+    formulaVersions,
+    conflictDrafts
   }
 }
 
@@ -218,7 +422,16 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [
+      db.formulas,
+      db.materials,
+      db.proportions,
+      db.batches,
+      db.cellars,
+      db.tastings,
+      db.formulaVersions,
+      db.conflictDrafts
+    ],
     async () => {
       await db.formulas.bulkPut(snapshot.formulas)
       await db.materials.bulkPut(snapshot.materials)
@@ -226,6 +439,8 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
       await db.batches.bulkPut(snapshot.batches)
       await db.cellars.bulkPut(snapshot.cellars)
       await db.tastings.bulkPut(snapshot.tastings)
+      if (Array.isArray(snapshot.formulaVersions)) await db.formulaVersions.bulkPut(snapshot.formulaVersions)
+      if (Array.isArray(snapshot.conflictDrafts)) await db.conflictDrafts.bulkPut(snapshot.conflictDrafts)
     }
   )
 }
@@ -247,10 +462,15 @@ const SEED_IDS = {
   materialDing: 'seed_material_ding',
   batchLine: 'seed_batch_line',
   batchPill: 'seed_batch_pill',
+  batchPlate: 'seed_batch_plate',
   cellarLine: 'seed_cellar_line',
   cellarPill: 'seed_cellar_pill',
   tastingLine: 'seed_tasting_line',
-  tastingPill: 'seed_tasting_pill'
+  tastingPill: 'seed_tasting_pill',
+  verLineV1: 'seed_fver_line_1',
+  verLineV2: 'seed_fver_line_2',
+  verPillV1: 'seed_fver_pill_1',
+  verPlateV1: 'seed_fver_plate_1'
 } as const
 
 /**
@@ -259,7 +479,15 @@ const SEED_IDS = {
  */
 export async function seedDatabase(): Promise<void> {
   const now = Date.now()
+  // 现行配比（v2）：线香批次入窖后调整过配比，原批次冻结 v1 快照
   const lineRatio: Array<[string, string, number, Proportion['role'], string]> = [
+    [SEED_IDS.materialChen, 'seed_prop_line_1', 46, '君', '陈化三年，去其燥气'],
+    [SEED_IDS.materialTan, 'seed_prop_line_2', 29, '臣', '酒蒸后阴干，增其醇厚'],
+    [SEED_IDS.materialRuxiang, 'seed_prop_line_3', 15, '佐', '乳香定香，缓其挥发'],
+    [SEED_IDS.materialDing, 'seed_prop_line_4', 10, '使', '少许即足以引诸香']
+  ]
+  // 入窖冻结的旧配比（v1）
+  const lineRatioV1: Array<[string, string, number, Proportion['role'], string]> = [
     [SEED_IDS.materialChen, 'seed_prop_line_1', 45, '君', '陈化三年，去其燥气'],
     [SEED_IDS.materialTan, 'seed_prop_line_2', 30, '臣', '酒蒸后阴干，增其醇厚'],
     [SEED_IDS.materialRuxiang, 'seed_prop_line_3', 15, '佐', '乳香定香，缓其挥发'],
@@ -280,6 +508,8 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-03-12',
       totalRatio: 100,
       state: '在用',
+      versionNo: 2,
+      rev: 2,
       updatedAt: now
     },
     {
@@ -290,6 +520,8 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-05-08',
       totalRatio: 100,
       state: '在用',
+      versionNo: 1,
+      rev: 2,
       updatedAt: now
     },
     {
@@ -300,6 +532,8 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-08-21',
       totalRatio: 0,
       state: '草稿',
+      versionNo: 1,
+      rev: 1,
       updatedAt: now
     }
   ]
@@ -387,8 +621,26 @@ export async function seedDatabase(): Promise<void> {
       formingMethod: '挤条',
       quantity: 320,
       operator: '林砚舟',
-      snapshot: toSnapshot(lineRatio),
+      snapshot: toSnapshot(lineRatioV1),
       snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      snapshotState: 'frozen',
+      formulaVersionNo: 1,
+      versionTrail: [
+        {
+          versionNo: 1,
+          state: 'current',
+          reason: '和香固化',
+          at: new Date('2024-04-01T09:00:00').getTime(),
+          note: '和香批次登记，固化当时配比'
+        },
+        {
+          versionNo: 1,
+          state: 'frozen',
+          reason: '入窖冻结',
+          at: new Date('2024-04-05T09:00:00').getTime(),
+          note: '入窖窖藏，冻结原快照 v1'
+        }
+      ],
       updatedAt: now
     },
     {
@@ -400,6 +652,87 @@ export async function seedDatabase(): Promise<void> {
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
       snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      snapshotState: 'current',
+      formulaVersionNo: 1,
+      versionTrail: [
+        {
+          versionNo: 1,
+          state: 'current',
+          reason: '和香固化',
+          at: new Date('2024-06-15T14:30:00').getTime(),
+          note: '和香批次登记，固化当时配比'
+        }
+      ],
+      updatedAt: now
+    },
+    {
+      // 旧档批次：缺快照、未入窖，等待人工复核，其品香不自动并入均分
+      id: SEED_IDS.batchPlate,
+      formulaId: SEED_IDS.formulaPill,
+      mixedAt: '2024-08-02',
+      formingMethod: '手搓',
+      quantity: 60,
+      operator: '周若谷',
+      snapshot: [],
+      snapshotAt: 0,
+      snapshotState: 'pending_review',
+      formulaVersionNo: 0,
+      versionTrail: [
+        {
+          versionNo: 0,
+          state: 'pending_review',
+          reason: '档案补录',
+          at: now,
+          note: '旧档批次缺少配比快照，待人工复核'
+        }
+      ],
+      updatedAt: now
+    }
+  ]
+
+  const versions: FormulaVersion[] = [
+    {
+      id: SEED_IDS.verLineV1,
+      formulaId: SEED_IDS.formulaLine,
+      versionNo: 1,
+      snapshot: toSnapshot(lineRatioV1),
+      totalRatio: 100,
+      reason: '建方',
+      operator: '',
+      createdAt: new Date('2024-03-12T10:00:00').getTime(),
+      updatedAt: now
+    },
+    {
+      id: SEED_IDS.verLineV2,
+      formulaId: SEED_IDS.formulaLine,
+      versionNo: 2,
+      snapshot: toSnapshot(lineRatio),
+      totalRatio: 100,
+      reason: '配比调整',
+      operator: '',
+      createdAt: new Date('2024-09-01T10:00:00').getTime(),
+      updatedAt: now
+    },
+    {
+      id: SEED_IDS.verPillV1,
+      formulaId: SEED_IDS.formulaPill,
+      versionNo: 1,
+      snapshot: toSnapshot(pillRatio),
+      totalRatio: 100,
+      reason: '建方',
+      operator: '',
+      createdAt: new Date('2024-05-08T10:00:00').getTime(),
+      updatedAt: now
+    },
+    {
+      id: SEED_IDS.verPlateV1,
+      formulaId: SEED_IDS.formulaPlate,
+      versionNo: 1,
+      snapshot: [],
+      totalRatio: 0,
+      reason: '建方',
+      operator: '',
+      createdAt: new Date('2024-08-21T10:00:00').getTime(),
       updatedAt: now
     }
   ]
@@ -414,17 +747,7 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
-      updatedAt: now
-    },
-    {
-      id: SEED_IDS.cellarPill,
-      batchId: SEED_IDS.batchPill,
-      startDate: '2024-06-20',
-      endDate: '2025-06-20',
-      temperatureC: 19,
-      humidityPct: 62,
-      container: '锡罐',
-      state: '已出窖',
+      formulaVersionNo: 1,
       updatedAt: now
     }
   ]
@@ -437,24 +760,34 @@ export async function seedDatabase(): Promise<void> {
       aroma: '初闻清甜，中段檀香渐起，尾调沉静',
       lastingMin: 65,
       smokeScore: 9,
-      comment: '烟气柔和，静室午后一炷最宜',
+      comment: '烟气柔和，静室午后一炷最宜（依据 v1 冻结方）',
       updatedAt: now
     },
     {
+      // 挂在待复核批次上：不自动并入香方均分，待复核通过后才计入
       id: SEED_IDS.tastingPill,
-      batchId: SEED_IDS.batchPill,
+      batchId: SEED_IDS.batchPlate,
       tastedAt: '2024-09-11',
       aroma: '蜜香裹沉香，凉意收尾',
       lastingMin: 48,
       smokeScore: 8,
-      comment: '丸体稍硬，可再陈三月',
+      comment: '丸体稍硬，可再陈三月；批次快照待复核，暂不计入均分',
       updatedAt: now
     }
   ]
 
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [
+      db.formulas,
+      db.materials,
+      db.proportions,
+      db.batches,
+      db.cellars,
+      db.tastings,
+      db.formulaVersions,
+      db.conflictDrafts
+    ],
     async () => {
       await db.formulas.bulkPut(formulas)
       await db.materials.bulkPut(materials)
@@ -462,6 +795,7 @@ export async function seedDatabase(): Promise<void> {
       await db.batches.bulkPut(batches)
       await db.cellars.bulkPut(cellars)
       await db.tastings.bulkPut(tastings)
+      await db.formulaVersions.bulkPut(versions)
     }
   )
 }

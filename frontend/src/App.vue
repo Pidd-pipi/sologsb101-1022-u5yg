@@ -7,6 +7,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -15,6 +16,7 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const conflictStore = useConflictStore()
 
 interface NavItem {
   path: string
@@ -113,6 +115,20 @@ function go(path: string): void {
       <p class="app-crumb muted">
         当前位置：{{ currentTitle }} · 本地结构版本 v{{ DB_VERSION }}
       </p>
+      <el-alert
+        v-if="conflictStore.unresolvedCount > 0 && route.path !== '/formulas' && route.path !== '/proportions'"
+        class="app-conflict"
+        type="error"
+        show-icon
+        :closable="false"
+      >
+        <template #title>
+          <span>
+            有 {{ conflictStore.unresolvedCount }} 份并发编辑冲突草稿待处理
+            <el-button size="small" text type="primary" @click="router.push('/formulas')">前往香方台账处理</el-button>
+          </span>
+        </template>
+      </el-alert>
       <router-view v-slot="{ Component: PageComponent }">
         <component :is="PageComponent" />
       </router-view>
@@ -228,6 +244,10 @@ function go(path: string): void {
 .app-crumb {
   margin: 0 0 12px;
   font-size: 12px;
+}
+
+.app-conflict {
+  margin-bottom: 12px;
 }
 
 .app-footer {
