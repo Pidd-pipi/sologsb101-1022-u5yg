@@ -2,6 +2,13 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { db, createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import {
+  clearFormulaDraft,
+  readAllFormulaDrafts,
+  readFormulaDraft,
+  saveFormulaDraft
+} from '@/utils/version'
+import type { FormulaDraft } from '@/types/version'
 import type { Batch } from '@/types/batch'
 import type { Tasting } from '@/types/tasting'
 import {
@@ -75,16 +82,25 @@ export const useFormulaStore = defineStore('formula', () => {
     return grouped
   })
 
-  /** 同香方全部品香的评分均分 */
+  /** 待复核（缺快照）批次 id 集合：其品香不自动并入香方均分 */
+  const pendingBatchIds = computed<Set<string>>(
+    () => new Set(batches.value.filter((batch) => batch.reviewState === 'pending').map((batch) => batch.id))
+  )
+
+  /** 待复核批次数量，供台账与品香页提示 */
+  const pendingBatchCount = computed(() => pendingBatchIds.value.size)
+
+  /** 同香方全部品香的评分均分（待复核批次的品香不并入） */
   const scoreAggregates = computed<Record<string, { count: number; average: number; latestAt: string }>>(() => {
     const aggregate: Record<string, { count: number; average: number; latestAt: string }> = {}
     Object.entries(tastingsByFormula.value).forEach(([formulaId, list]) => {
-      if (list.length === 0) return
-      const sum = list.reduce((acc, item) => acc + item.smokeScore, 0)
-      const latest = [...list].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]
+      const valid = list.filter((item) => !pendingBatchIds.value.has(item.batchId))
+      if (valid.length === 0) return
+      const sum = valid.reduce((acc, item) => acc + item.smokeScore, 0)
+      const latest = [...valid].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]
       aggregate[formulaId] = {
-        count: list.length,
-        average: round(sum / list.length, 1),
+        count: valid.length,
+        average: round(sum / valid.length, 1),
         latestAt: latest?.tastedAt ?? ''
       }
     })
@@ -195,7 +211,8 @@ export const useFormulaStore = defineStore('formula', () => {
         usage: payload.usage,
         createdAt: payload.createdAt,
         totalRatio: 0,
-        state: payload.state ?? '草稿'
+        state: payload.state ?? '草稿',
+        currentVersion: 1
       },
       'formula'
     )
@@ -206,6 +223,88 @@ export const useFormulaStore = defineStore('formula', () => {
   async function updateFormula(id: string, patch: Partial<Formula>): Promise<void> {
     await formulaTable.update(id, patch)
   }
+
+  /** 本地留存的编辑冲突草稿（localStorage），按香方 id 索引 */
+  const drafts = ref<Record<string, FormulaDraft>>({})
+
+  function loadDrafts(): void {
+    const map: Record<string, FormulaDraft> = {}
+    readAllFormulaDrafts().forEach((draft) => {
+      map[draft.formulaId] = draft
+    })
+    drafts.value = map
+  }
+
+  /** 打开编辑时读取该香方是否有未应用的草稿 */
+  function draftOf(formulaId: string): FormulaDraft | null {
+    return drafts.value[formulaId] ?? readFormulaDraft(formulaId)
+  }
+
+  /**
+   * 带冲突检测的香方保存：
+   * 若自打开编辑后香方已被其他页面改动（updatedAt 变化），则不覆盖，
+   * 把本次编辑存为草稿并返回 conflict=true，由页面提示冲突。
+   */
+  async function updateFormulaWithConflictCheck(
+    id: string,
+    patch: Partial<Formula>,
+    baseUpdatedAt: number
+  ): Promise<{ conflict: boolean; conflictVersion: number }> {
+    const current = await db.formulas.get(id)
+    if (!current) throw new Error('香方不存在，无法保存')
+    if (current.updatedAt !== baseUpdatedAt) {
+      const draft: FormulaDraft = {
+        formulaId: id,
+        conflictVersion: current.currentVersion,
+        conflictAt: current.updatedAt,
+        patch: {
+          name: patch.name,
+          scentType: patch.scentType,
+          usage: patch.usage,
+          state: patch.state,
+          createdAt: patch.createdAt
+        },
+        savedAt: Date.now()
+      }
+      saveFormulaDraft(draft)
+      drafts.value = { ...drafts.value, [id]: draft }
+      return { conflict: true, conflictVersion: current.currentVersion }
+    }
+    await formulaTable.update(id, patch)
+    clearFormulaDraft(id)
+    const nextDrafts = { ...drafts.value }
+    delete nextDrafts[id]
+    drafts.value = nextDrafts
+    return { conflict: false, conflictVersion: current.currentVersion }
+  }
+
+  /** 应用某香方的冲突草稿（覆盖当前主档） */
+  async function applyDraft(formulaId: string): Promise<void> {
+    const draft = drafts.value[formulaId] ?? readFormulaDraft(formulaId)
+    if (!draft) return
+    const patch: Partial<Formula> = {
+      name: draft.patch.name,
+      scentType: draft.patch.scentType as ScentType | undefined,
+      usage: draft.patch.usage as UsageScene | undefined,
+      state: draft.patch.state as FormulaState | undefined,
+      createdAt: draft.patch.createdAt
+    }
+    await formulaTable.update(formulaId, patch)
+    clearFormulaDraft(formulaId)
+    const nextDrafts = { ...drafts.value }
+    delete nextDrafts[formulaId]
+    drafts.value = nextDrafts
+  }
+
+  /** 丢弃某香方的冲突草稿 */
+  function discardDraft(formulaId: string): void {
+    clearFormulaDraft(formulaId)
+    const nextDrafts = { ...drafts.value }
+    delete nextDrafts[formulaId]
+    drafts.value = nextDrafts
+  }
+
+  loadDrafts()
 
   /** 状态流转：草稿 → 在用 → 停用 → 在用 */
   async function advanceState(id: string): Promise<FormulaState | null> {
@@ -259,7 +358,8 @@ export const useFormulaStore = defineStore('formula', () => {
         usage: source.usage,
         createdAt: new Date().toISOString().slice(0, 10),
         totalRatio: source.totalRatio,
-        state: '草稿'
+        state: '草稿',
+        currentVersion: 1
       },
       'formula'
     )
@@ -292,6 +392,8 @@ export const useFormulaStore = defineStore('formula', () => {
     filteredFormulas,
     filteredCards,
     batchesByFormula,
+    pendingBatchIds,
+    pendingBatchCount,
     tastingsByFormula,
     scoreAggregates,
     stateCounts,
@@ -299,6 +401,8 @@ export const useFormulaStore = defineStore('formula', () => {
     averageScoreAll,
     inUseCount,
     balancedCount,
+    drafts,
+    draftOf,
     setCurrentFormula,
     setMaterialCountMap,
     patchFilter,
@@ -307,6 +411,9 @@ export const useFormulaStore = defineStore('formula', () => {
     formulaName,
     createFormula,
     updateFormula,
+    updateFormulaWithConflictCheck,
+    applyDraft,
+    discardDraft,
     advanceState,
     setState,
     removeFormula,

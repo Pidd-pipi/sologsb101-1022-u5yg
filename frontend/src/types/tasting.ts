@@ -62,6 +62,10 @@ export interface TastingRow {
   formulaId: string | null
   formulaName: string
   formingMethod: string
+  /** 批次是否待复核（缺快照）：若是，品香不并入香方均分 */
+  pendingReview: boolean
+  /** 批次快照所属版本号 */
+  formulaVersion: number
 }
 
 /** 某香方的品香均分聚合结果 */

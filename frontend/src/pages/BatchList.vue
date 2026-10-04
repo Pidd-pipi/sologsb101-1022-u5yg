@@ -14,6 +14,8 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
+import { diffSnapshots, getCurrentVersion, listFormulaVersions, recalculateBatchSnapshot } from '@/utils/version'
+import type { FormulaVersion } from '@/types/version'
 import {
   FORMING_METHODS,
   createEmptyBatchFilter,
@@ -148,6 +150,18 @@ const rows = computed<BatchRow[]>(() =>
       2
     )
     const cellars = cellarStore.cellarsOfBatch(batch.id)
+    const pendingReview = batch.reviewState === 'pending'
+    const currentSnapshot = proportionStore
+      .proportionsByFormula(batch.formulaId)
+      .slice()
+      .sort((a, b) => a.seq - b.seq)
+      .map((proportion) => ({
+        materialId: proportion.materialId,
+        materialName: '',
+        ratio: round(proportion.ratio, 2),
+        role: proportion.role
+      }))
+    const snapshotMatched = !pendingReview && diffSnapshots(batch.snapshot, currentSnapshot).matched
     return {
       batch,
       formulaName: formulaStore.formulaName(batch.formulaId),
@@ -155,7 +169,10 @@ const rows = computed<BatchRow[]>(() =>
       currentRatioTotal,
       snapshotRatioTotal,
       cellared: cellars.length > 0,
-      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / ')
+      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / '),
+      snapshotMatched,
+      formulaVersion: typeof batch.formulaVersion === 'number' ? batch.formulaVersion : 1,
+      pendingReview
     }
   })
 )
@@ -176,14 +193,15 @@ const filteredRows = computed<BatchRow[]>(() =>
 
 const totalQuantity = computed(() => filteredRows.value.reduce((sum, row) => sum + row.batch.quantity, 0))
 const cellaredCount = computed(() => rows.value.filter((row) => row.cellared).length)
-const driftedCount = computed(() =>
-  rows.value.filter((row) => Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01).length
-)
+const driftedCount = computed(() => rows.value.filter((row) => !row.snapshotMatched).length)
+const pendingCount = computed(() => rows.value.filter((row) => row.pendingReview).length)
 const averageQuantity = computed(() =>
   rows.value.length === 0 ? 0 : Math.round(rows.value.reduce((sum, row) => sum + row.batch.quantity, 0) / rows.value.length)
 )
 
 const detailRow = computed<BatchRow | null>(() => rows.value.find((row) => row.batch.id === detailBatchId.value) ?? null)
+/** 当前详情香方的版本链历史 */
+const detailVersions = ref<FormulaVersion[]>([])
 
 /** 香方 id → 配比味数，用于快照对照时回显 */
 const proportionCountMap = computed<Record<string, number>>(() => proportionStore.materialCountMap)
@@ -280,7 +298,9 @@ async function submitForm(): Promise<void> {
           quantity: form.quantity,
           operator: form.operator.trim(),
           snapshot,
-          snapshotAt: Date.now()
+          snapshotAt: Date.now(),
+          formulaVersion: await getCurrentVersion(form.formulaId),
+          reviewState: snapshot.length === 0 ? 'pending' : 'ok'
         },
         'batch'
       )
@@ -312,14 +332,20 @@ async function removeBatch(row: BatchRow): Promise<void> {
 }
 
 async function refreshSnapshot(row: BatchRow): Promise<void> {
-  const snapshot = await buildSnapshot(row.batch.formulaId)
-  await batchTable.update(row.batch.id, { snapshot, snapshotAt: Date.now() })
-  ElMessage.success('已按当前配比重置快照')
+  await recalculateBatchSnapshot(row.batch.id)
+  ElMessage.success('已按当前配比重置快照，版本与当前方一致')
 }
 
-function openDetail(row: BatchRow): void {
+/** 补快照并复核：用于缺快照的旧批次，复核后品香重新并入均分 */
+async function reviewBatch(row: BatchRow): Promise<void> {
+  await recalculateBatchSnapshot(row.batch.id)
+  ElMessage.success(`已补快照并复核「${row.formulaName} · ${row.batch.mixedAt}」，其品香现可并入均分`)
+}
+
+async function openDetail(row: BatchRow): Promise<void> {
   detailBatchId.value = row.batch.id
   detailVisible.value = true
+  detailVersions.value = await listFormulaVersions(row.batch.formulaId)
 }
 
 function goCellar(row: BatchRow): void {
@@ -339,8 +365,8 @@ function goProportion(row: BatchRow): void {
       <div>
         <h2>和香工序与成型登记</h2>
         <p>
-          共 {{ rows.length }} 个批次 · 已入窖 {{ cellaredCount }} 个 · 配比改动 {{ driftedCount }} 个 · 当前筛选
-          {{ filteredRows.length }} 个
+          共 {{ rows.length }} 个批次 · 已入窖 {{ cellaredCount }} 个 · 配比改动 {{ driftedCount }} 个 · 待复核
+          {{ pendingCount }} 个 · 当前筛选 {{ filteredRows.length }} 个
         </p>
       </div>
       <div class="page-title__actions">
@@ -353,6 +379,14 @@ function goProportion(row: BatchRow): void {
       <StatBadge label="筛选中数量" :value="totalQuantity" suffix="支/丸" icon="Histogram" tone="info" />
       <StatBadge label="已入窖" :value="cellaredCount" suffix="个" icon="Coin" tone="success" />
       <StatBadge label="配比已改动" :value="driftedCount" suffix="个" icon="Document" tone="warning" hint="当前配比合计与批次快照不一致" />
+      <StatBadge
+        label="待复核"
+        :value="pendingCount"
+        suffix="个"
+        icon="WarningFilled"
+        tone="danger"
+        hint="缺快照批次，品香暂不并入均分，补快照后复核"
+      />
       <StatBadge label="平均产量" :value="averageQuantity" suffix="支/丸" icon="TrendCharts" tone="default" />
     </div>
 
@@ -380,9 +414,13 @@ function goProportion(row: BatchRow): void {
       </div>
 
       <el-table v-else :data="filteredRows" row-key="batch.id" stripe>
-        <el-table-column label="香方 / 批次号" min-width="200">
+        <el-table-column label="香方 / 批次号" min-width="220">
           <template #default="{ row }: { row: BatchRow }">
-            <div class="cell-main">{{ row.formulaName }}</div>
+            <div class="cell-main">
+              {{ row.formulaName }}
+              <el-tag size="small" effect="plain" round class="version-tag">v{{ row.formulaVersion }}</el-tag>
+              <el-tag v-if="row.pendingReview" size="small" type="warning" effect="dark" round>待复核</el-tag>
+            </div>
             <div class="cell-sub muted mono">批次 {{ row.batch.id.slice(-8) }} · 快照 {{ row.snapshotCount }} 味</div>
           </template>
         </el-table-column>
@@ -394,14 +432,15 @@ function goProportion(row: BatchRow): void {
           </template>
         </el-table-column>
         <el-table-column label="制香人" prop="batch.operator" width="120" />
-        <el-table-column label="配比对照" min-width="190">
+        <el-table-column label="配比对照" min-width="230">
           <template #default="{ row }: { row: BatchRow }">
             <div class="cell-sub">
               快照合计 <span class="mono">{{ row.snapshotRatioTotal }}%</span> · 当前合计
               <span class="mono">{{ row.currentRatioTotal }}%</span>
             </div>
-            <div class="cell-sub" :class="Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? 'ratio-error' : 'ratio-ok'">
-              {{ Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? '改方后配比已变化' : '配比与快照一致' }}
+            <div v-if="row.pendingReview" class="cell-sub ratio-error">缺快照 · 待复核（品香暂不并入均分）</div>
+            <div v-else class="cell-sub" :class="row.snapshotMatched ? 'ratio-ok' : 'ratio-error'">
+              {{ row.snapshotMatched ? '快照与当前配比一致' : '改方后配比已变化 · 未入窖已自动重算' }}
             </div>
           </template>
         </el-table-column>
@@ -410,9 +449,10 @@ function goProportion(row: BatchRow): void {
             <el-tag :type="row.cellared ? 'success' : 'info'" effect="plain" round>{{ row.cellarState }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="300" fixed="right">
+        <el-table-column label="操作" width="360" fixed="right">
           <template #default="{ row }: { row: BatchRow }">
             <el-button size="small" text type="primary" :icon="Document" @click="openDetail(row)">快照对照</el-button>
+            <el-button v-if="row.pendingReview" size="small" text type="warning" @click="reviewBatch(row)">补快照复核</el-button>
             <el-button size="small" text @click="goCellar(row)">窖藏</el-button>
             <el-button size="small" text :icon="Edit" @click="openEdit(row.batch)">编辑</el-button>
             <el-button size="small" text type="danger" :icon="Delete" @click="removeBatch(row)">删除</el-button>
@@ -470,12 +510,19 @@ function goProportion(row: BatchRow): void {
     <el-drawer v-model="detailVisible" title="配比快照对照" size="520px" append-to-body>
       <template v-if="detailRow">
         <div class="snapshot-head">
-          <h3>{{ detailRow.formulaName }}</h3>
+          <h3>
+            {{ detailRow.formulaName }}
+            <el-tag size="small" effect="plain" round class="version-tag">快照 v{{ detailRow.formulaVersion }}</el-tag>
+            <el-tag v-if="detailRow.pendingReview" size="small" type="warning" effect="dark" round>待复核</el-tag>
+          </h3>
           <p class="muted">
             和香 {{ detailRow.batch.mixedAt }} · {{ detailRow.batch.formingMethod }} · {{ detailRow.batch.quantity }} 支 ·
             {{ detailRow.batch.operator }}
           </p>
-          <p class="muted">快照固化于 {{ new Date(detailRow.batch.snapshotAt || Date.now()).toLocaleString('zh-CN') }}</p>
+          <p class="muted">
+            快照固化于 {{ new Date(detailRow.batch.snapshotAt || Date.now()).toLocaleString('zh-CN') }} ·
+            {{ detailRow.cellared ? '已入窖 · 快照冻结' : '未入窖 · 随配比重算' }}
+          </p>
         </div>
 
         <div class="snapshot-badges">
@@ -505,6 +552,25 @@ function goProportion(row: BatchRow): void {
             </template>
           </el-table-column>
         </el-table>
+
+        <div class="version-chain">
+          <h4>版本链（{{ detailVersions.length }} 版）</h4>
+          <div v-if="detailVersions.length === 0" class="muted cell-sub">暂无版本记录</div>
+          <el-timeline v-else>
+            <el-timeline-item
+              v-for="version in detailVersions"
+              :key="version.id"
+              :timestamp="new Date(version.changedAt).toLocaleString('zh-CN')"
+              placement="top"
+              :type="version.version === detailRow.formulaVersion ? 'primary' : ''"
+            >
+              <span class="cell-sub">
+                v{{ version.version }} · {{ version.changeNote }} · {{ version.snapshot.length }} 味
+                <template v-if="version.version === detailRow.formulaVersion"> · 当前批次快照</template>
+              </span>
+            </el-timeline-item>
+          </el-timeline>
+        </div>
 
         <div class="snapshot-actions">
           <el-button :icon="Document" @click="refreshSnapshot(detailRow)">按当前配比重置快照</el-button>
@@ -543,7 +609,11 @@ function goProportion(row: BatchRow): void {
 }
 
 .snapshot-head h3 {
-  margin: 0 0 4px;
+  margin: 0 0  4px;
+}
+
+.version-tag {
+  margin-left: 6px;
 }
 
 .snapshot-head p {
@@ -561,5 +631,21 @@ function goProportion(row: BatchRow): void {
   display: flex;
   gap: 8px;
   margin-top: 16px;
+}
+
+.version-chain {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+
+.version-chain h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #6b6257;
+}
+
+.version-chain :deep(.el-timeline-item__content) {
+  font-size: 12px;
 }
 </style>

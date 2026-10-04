@@ -217,6 +217,7 @@ export const useCellarStore = defineStore('cellar', () => {
     humidityPct: number
     container: CellarContainer
     state?: CellarState
+    formulaVersion?: number
   }): Promise<Cellar> {
     return cellarTable.create(
       {
@@ -226,7 +227,8 @@ export const useCellarStore = defineStore('cellar', () => {
         temperatureC: round(payload.temperatureC, 1),
         humidityPct: round(payload.humidityPct, 1),
         container: payload.container,
-        state: payload.state ?? '窖藏中'
+        state: payload.state ?? '窖藏中',
+        formulaVersion: payload.formulaVersion ?? 1
       },
       'cellar'
     )

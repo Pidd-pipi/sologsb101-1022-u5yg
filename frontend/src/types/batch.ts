@@ -25,6 +25,10 @@ export interface Batch {
   snapshot: BatchSnapshotItem[]
   /** 快照固化时间戳 */
   snapshotAt: number
+  /** 快照所属香方版本号：未入窖批次随配比重算，入窖后冻结 */
+  formulaVersion: number
+  /** 复核状态：缺快照标记 pending，不并入品香均分 */
+  reviewState: 'ok' | 'pending'
   updatedAt: number
 }
 
@@ -43,6 +47,12 @@ export interface BatchRow {
   /** 是否已进入窖藏 */
   cellared: boolean
   cellarState: string
+  /** 快照是否与当前配比一致（未入窖批次应始终一致） */
+  snapshotMatched: boolean
+  /** 快照所属版本号 */
+  formulaVersion: number
+  /** 是否待复核（缺快照） */
+  pendingReview: boolean
 }
 
 /** 批次筛选条件 */

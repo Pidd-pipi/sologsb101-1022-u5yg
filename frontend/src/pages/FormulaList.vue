@@ -32,6 +32,8 @@ const dialogVisible = ref(false)
 const importVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
+/** 打开编辑时香方的 updatedAt，用于冲突检测 */
+const editingBaseUpdatedAt = ref(0)
 const formRef = ref<FormInstance>()
 const importText = ref('')
 const importFileName = ref('')
@@ -146,12 +148,15 @@ function openCreate(): void {
 
 function openEdit(formula: Formula): void {
   editingId.value = formula.id
-  form.name = formula.name
-  form.scentType = formula.scentType
-  form.usage = formula.usage
-  form.state = formula.state
-  form.createdAt = formula.createdAt
+  editingBaseUpdatedAt.value = formula.updatedAt
+  const draft = formulaStore.draftOf(formula.id)
+  form.name = draft?.patch.name ?? formula.name
+  form.scentType = (draft?.patch.scentType as ScentType) ?? formula.scentType
+  form.usage = (draft?.patch.usage as UsageScene) ?? formula.usage
+  form.state = (draft?.patch.state as FormulaState) ?? formula.state
+  form.createdAt = draft?.patch.createdAt ?? formula.createdAt
   dialogVisible.value = true
+  if (draft) ElMessage.info('已恢复您之前未保存的编辑草稿，保存时将再次检测冲突')
 }
 
 async function submitForm(): Promise<void> {
@@ -161,13 +166,26 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await formulaStore.updateFormula(editingId.value, {
-        name: form.name.trim(),
-        scentType: form.scentType,
-        usage: form.usage,
-        state: form.state,
-        createdAt: form.createdAt
-      })
+      const result = await formulaStore.updateFormulaWithConflictCheck(
+        editingId.value,
+        {
+          name: form.name.trim(),
+          scentType: form.scentType,
+          usage: form.usage,
+          state: form.state,
+          createdAt: form.createdAt
+        },
+        editingBaseUpdatedAt.value
+      )
+      if (result.conflict) {
+        dialogVisible.value = false
+        ElMessageBox.alert(
+          `该香方已在其他页面被保存（当前 v${result.conflictVersion}），您的修改未覆盖，已存为草稿。可在卡片上「应用草稿」或「丢弃草稿」。`,
+          '保存冲突',
+          { type: 'warning', confirmButtonText: '知道了' }
+        )
+        return
+      }
       ElMessage.success('香方已更新')
     } else {
       const formula = await formulaStore.createFormula({
@@ -215,6 +233,18 @@ async function removeFormula(formula: Formula): Promise<void> {
 async function duplicateFormula(formula: Formula): Promise<void> {
   const copy = await formulaStore.duplicateFormula(formula.id)
   if (copy) ElMessage.success(`已复制为「${copy.name}」（草稿），可在此基础上改方`)
+}
+
+async function applyDraft(formula: Formula): Promise<void> {
+  const draft = formulaStore.draftOf(formula.id)
+  if (!draft) return
+  await formulaStore.applyDraft(formula.id)
+  ElMessage.success(`已应用「${formula.name}」的冲突草稿（基于 v${draft.conflictVersion}）`)
+}
+
+function discardDraft(formula: Formula): void {
+  formulaStore.discardDraft(formula.id)
+  ElMessage.info(`已丢弃「${formula.name}」的冲突草稿`)
 }
 
 function openProportion(formula: Formula): void {
@@ -363,7 +393,17 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
       <article v-for="card in cards" :key="card.formula.id" class="formula-card">
         <header class="formula-card__head">
           <div>
-            <h3>{{ card.formula.name }}</h3>
+            <h3>
+              {{ card.formula.name }}
+              <el-tag size="small" effect="plain" round class="version-tag">v{{ card.formula.currentVersion ?? 1 }}</el-tag>
+              <el-tag
+                v-if="formulaStore.draftOf(card.formula.id)"
+                size="small"
+                type="warning"
+                effect="dark"
+                round
+              >草稿待应用</el-tag>
+            </h3>
             <p class="muted">
               {{ card.formula.scentType }} · {{ card.formula.usage }} · 创方 {{ card.formula.createdAt }}
             </p>
@@ -407,6 +447,10 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
           <el-button size="small" :icon="Edit" @click="openEdit(card.formula)">编辑</el-button>
           <el-button size="small" :icon="Download" @click="exportOne(card.formula)">导出</el-button>
           <el-button size="small" @click="duplicateFormula(card.formula)">复制</el-button>
+          <template v-if="formulaStore.draftOf(card.formula.id)">
+            <el-button size="small" type="warning" plain @click="applyDraft(card.formula)">应用草稿</el-button>
+            <el-button size="small" type="info" plain @click="discardDraft(card.formula)">丢弃草稿</el-button>
+          </template>
           <el-dropdown trigger="click" @command="(command: string) => setState(card.formula, command as FormulaState)">
             <el-button size="small">状态</el-button>
             <template #dropdown>
@@ -517,6 +561,11 @@ const ratioText = (card: FormulaCard): string => `${round(card.formula.totalRati
 .formula-card__head h3 {
   margin: 0;
   font-size: 17px;
+}
+
+.version-tag {
+  margin-left: 6px;
+  font-weight: 500;
 }
 
 .formula-card__head p {

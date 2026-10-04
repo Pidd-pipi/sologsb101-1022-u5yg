@@ -21,8 +21,9 @@ import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { FormulaVersion } from '@/types/version'
 
-/** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
+/** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香与版本链 */
 export interface FormulaExportPayload {
   app: 'gbincense'
   kind: 'formula'
@@ -35,6 +36,8 @@ export interface FormulaExportPayload {
   tastings: Tasting[]
   /** 导出时一并携带被引用的香料主档，便于跨设备还原 */
   materials: Material[]
+  /** 该香方的配比版本链 */
+  formulaVersions: FormulaVersion[]
 }
 
 export interface ValidateResult<T> {
@@ -86,6 +89,7 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
   const materialIds = Array.from(new Set(proportions.map((item) => item.materialId)))
   const materials =
     materialIds.length > 0 ? await db.materials.where('id').anyOf(materialIds).toArray() : []
+  const formulaVersions = await db.formulaVersions.where('formulaId').equals(formulaId).sortBy('version')
   return {
     app: 'gbincense',
     kind: 'formula',
@@ -96,7 +100,8 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
     batches,
     cellars,
     tastings,
-    materials
+    materials,
+    formulaVersions
   }
 }
 
@@ -122,7 +127,8 @@ export async function exportFormulaJson(formulaId: string): Promise<{ fileName: 
       batches: payload.batches.length,
       cellars: payload.cellars.length,
       tastings: payload.tastings.length,
-      materials: payload.materials.length
+      materials: payload.materials.length,
+      formulaVersions: payload.formulaVersions.length
     }
   }
 }
@@ -151,7 +157,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       proportions: snapshot.proportions.length,
       batches: snapshot.batches.length,
       cellars: snapshot.cellars.length,
-      tastings: snapshot.tastings.length
+      tastings: snapshot.tastings.length,
+      formulaVersions: snapshot.formulaVersions.length
     }
   }
 }
@@ -174,6 +181,7 @@ function parseFormula(input: unknown, errors: string[]): Formula | null {
   const state = pickEnum<FormulaState>(input.state, FORMULA_STATE_SET, '草稿')
   const createdAt = asString(input.createdAt, new Date().toISOString().slice(0, 10))
   const totalRatio = asNumber(input.totalRatio, 0)
+  const currentVersion = asNumber(input.currentVersion, 1)
   if (errors.length > 0) return null
   return {
     id: asString(input.id, createId('formula')),
@@ -183,6 +191,7 @@ function parseFormula(input: unknown, errors: string[]): Formula | null {
     createdAt,
     totalRatio,
     state,
+    currentVersion: currentVersion > 0 ? currentVersion : 1,
     updatedAt: asNumber(input.updatedAt, Date.now())
   }
 }
@@ -308,6 +317,8 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
           }))
         : [],
       snapshotAt: asNumber(raw.snapshotAt, 0),
+      formulaVersion: asNumber(raw.formulaVersion, 1),
+      reviewState: raw.reviewState === 'pending' ? 'pending' : 'ok',
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -338,6 +349,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      formulaVersion: asNumber(raw.formulaVersion, 1),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -373,6 +385,38 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
 
   if (errors.length > 0) return { ok: false, errors, payload: null }
 
+  const formulaVersions: FormulaVersion[] = []
+  const rawVersions = Array.isArray(input.formulaVersions) ? (input.formulaVersions as unknown[]) : []
+  rawVersions.forEach((raw, index) => {
+    if (!isRecord(raw)) {
+      errors.push(`formulaVersions[${index}] 不是合法对象`)
+      return
+    }
+    const version = asNumber(raw.version, 0)
+    if (version <= 0) {
+      errors.push(`formulaVersions[${index}] version 应为正整数`)
+      return
+    }
+    formulaVersions.push({
+      id: asString(raw.id, createId('fver')),
+      formulaId: formula.id,
+      version,
+      snapshot: Array.isArray(raw.snapshot)
+        ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
+            materialId: asString(item.materialId),
+            materialName: asString(item.materialName, '未知香料'),
+            ratio: asNumber(item.ratio, 0),
+            role: asString(item.role, '君')
+          }))
+        : [],
+      changedAt: asNumber(raw.changedAt, Date.now()),
+      changeNote: asString(raw.changeNote, '导入版本'),
+      basedOn: asNumber(raw.basedOn, version - 1)
+    })
+  })
+
+  if (errors.length > 0) return { ok: false, errors, payload: null }
+
   return {
     ok: true,
     errors: [],
@@ -386,7 +430,8 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       batches,
       cellars,
       tastings,
-      materials
+      materials,
+      formulaVersions
     }
   }
 }
@@ -396,7 +441,7 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
   const errors: string[] = []
   if (!isRecord(input)) return { ok: false, errors: ['文件内容不是合法的 JSON 对象'], payload: null }
   if (input.app !== 'gbincense') errors.push('app 字段应为 gbincense，文件来源不明')
-  const keys = ['formulas', 'materials', 'proportions', 'batches', 'cellars', 'tastings'] as const
+  const keys = ['formulas', 'materials', 'proportions', 'batches', 'cellars', 'tastings', 'formulaVersions'] as const
   keys.forEach((key) => {
     if (!Array.isArray(input[key])) errors.push(`${key} 字段缺失或不是数组`)
   })
@@ -461,10 +506,19 @@ export async function importFormulaPayload(
       batchId: batchIdMap.get(tasting.batchId) as string,
       updatedAt: now
     }))
+  const formulaVersions: FormulaVersion[] = (payload.formulaVersions ?? []).map((version) => ({
+    ...version,
+    id: createId('fver'),
+    formulaId,
+    snapshot: version.snapshot.map((item) => ({
+      ...item,
+      materialId: materialIdMap.get(item.materialId) ?? item.materialId
+    }))
+  }))
 
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.formulaVersions],
     async () => {
       await db.formulas.put(formula)
       if (materials.length > 0) await db.materials.bulkPut(materials)
@@ -472,6 +526,7 @@ export async function importFormulaPayload(
       if (batches.length > 0) await db.batches.bulkPut(batches)
       if (cellars.length > 0) await db.cellars.bulkPut(cellars)
       if (tastings.length > 0) await db.tastings.bulkPut(tastings)
+      if (formulaVersions.length > 0) await db.formulaVersions.bulkPut(formulaVersions)
     }
   )
 
@@ -482,7 +537,8 @@ export async function importFormulaPayload(
       proportions: proportions.length,
       batches: batches.length,
       cellars: cellars.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      formulaVersions: formulaVersions.length
     }
   }
 }
@@ -499,7 +555,8 @@ export async function importSnapshotPayload(
     proportions: snapshot.proportions.length,
     batches: snapshot.batches.length,
     cellars: snapshot.cellars.length,
-    tastings: snapshot.tastings.length
+    tastings: snapshot.tastings.length,
+    formulaVersions: snapshot.formulaVersions.length
   }
 }
 

@@ -18,6 +18,8 @@ export interface Cellar {
   container: CellarContainer
   /** 状态：窖藏中/已出窖 */
   state: CellarState
+  /** 入窖当刻冻结的香方版本号，批次快照据此锁定不随配比重算 */
+  formulaVersion: number
   updatedAt: number
 }
 

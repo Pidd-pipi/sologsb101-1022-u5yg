@@ -181,7 +181,9 @@ const rows = computed<TastingRow[]>(() =>
       batchLabel: batch ? `${batch.mixedAt} · ${batch.formingMethod} · ${batch.quantity} 支` : '批次已删除',
       formulaId: batch?.formulaId ?? null,
       formulaName: batch ? formulaStore.formulaName(batch.formulaId) : '香方已删除',
-      formingMethod: batch?.formingMethod ?? '—'
+      formingMethod: batch?.formingMethod ?? '—',
+      pendingReview: batch?.reviewState === 'pending',
+      formulaVersion: typeof batch?.formulaVersion === 'number' ? batch.formulaVersion : 1
     }
   })
 )
@@ -200,11 +202,11 @@ const filteredRows = computed<TastingRow[]>(() =>
   })
 )
 
-/** 按香方聚合：同批次多次评鉴取均分并回写香方列表 */
+/** 按香方聚合：同批次多次评鉴取均分并回写香方列表（待复核批次不并入） */
 const aggregates = computed<ScoreAggregate[]>(() => {
   const grouped = new Map<string, Tasting[]>()
   rows.value.forEach((row) => {
-    if (!row.formulaId) return
+    if (!row.formulaId || row.pendingReview) return
     const list = grouped.get(row.formulaId) ?? []
     list.push(row.tasting)
     grouped.set(row.formulaId, list)
@@ -216,6 +218,9 @@ const aggregates = computed<ScoreAggregate[]>(() => {
     latestAt: [...list].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]?.tastedAt ?? ''
   }))
 })
+
+/** 待复核批次的品香条数（不并入均分） */
+const pendingTastingCount = computed(() => rows.value.filter((row) => row.pendingReview).length)
 
 const filteredAverage = computed(() => {
   if (filteredRows.value.length === 0) return 0
@@ -408,8 +413,8 @@ function onlyFormula(formulaId: string): void {
       <div>
         <h2>品香评鉴与香方导出</h2>
         <p>
-          共 {{ rows.length }} 条评鉴 · 上品 {{ excellentCount }} 条 · 筛选均分 {{ filteredAverage || '—' }} ·
-          本地结构版本 v{{ DB_VERSION }}
+          共 {{ rows.length }} 条评鉴 · 上品 {{ excellentCount }} 条 · 筛选均分 {{ filteredAverage || '—' }} · 待复核
+          {{ pendingTastingCount }} 条 · 本地结构版本 v{{ DB_VERSION }}
         </p>
       </div>
       <div class="page-title__actions">
@@ -466,6 +471,16 @@ function onlyFormula(formulaId: string): void {
       </el-table>
     </div>
 
+    <el-alert
+      v-if="pendingTastingCount > 0"
+      class="pending-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`有 ${pendingTastingCount} 条品香来自待复核批次（缺快照），暂未并入香方均分`"
+      description="请先到「和香批次」页对相应批次「补快照复核」，复核后其品香会自动并入均分。"
+    />
+
     <FilterBar
       :model-value="filterModel"
       :selects="filterSelects"
@@ -491,10 +506,15 @@ function onlyFormula(formulaId: string): void {
       </div>
 
       <el-table v-else :data="filteredRows" row-key="tasting.id" stripe>
-        <el-table-column label="香方 / 批次" min-width="200">
+        <el-table-column label="香方 / 批次" min-width="240">
           <template #default="{ row }: { row: TastingRow }">
-            <div class="cell-main">{{ row.formulaName }}</div>
+            <div class="cell-main">
+              {{ row.formulaName }}
+              <el-tag size="small" effect="plain" round class="version-tag">v{{ row.formulaVersion }}</el-tag>
+              <el-tag v-if="row.pendingReview" size="small" type="warning" effect="dark" round>待复核</el-tag>
+            </div>
             <div class="cell-sub muted">{{ row.batchLabel }}</div>
+            <div v-if="row.pendingReview" class="cell-sub ratio-error">批次缺快照，品香暂不并入均分</div>
           </template>
         </el-table-column>
         <el-table-column label="品鉴日期" prop="tasting.tastedAt" width="120" />
@@ -619,5 +639,14 @@ function onlyFormula(formulaId: string): void {
 
 .import-file {
   font-size: 13px;
+}
+
+.pending-alert {
+  margin-bottom: 16px;
+}
+
+.version-tag {
+  margin-left: 6px;
+  font-weight: 500;
 }
 </style>

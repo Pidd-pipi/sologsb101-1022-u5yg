@@ -5,9 +5,10 @@ import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { FormulaVersion } from '@/types/version'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -42,6 +43,7 @@ export interface IncenseSnapshot {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  formulaVersions: FormulaVersion[]
 }
 
 export class IncenseDatabase extends Dexie {
@@ -51,6 +53,7 @@ export class IncenseDatabase extends Dexie {
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
   tastings!: Table<Tasting, string>
+  formulaVersions!: Table<FormulaVersion, string>
 
   constructor() {
     super('gbincense')
@@ -64,7 +67,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -108,6 +111,70 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：香方 / 配比 / 批次 / 窖藏共用版本链，补版本号、复核状态与版本记录表
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, currentVersion, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, formulaVersion, reviewState, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, formulaVersion, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt',
+        formulaVersions: 'id, formulaId, version, changedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        // 迁移 1：为每款香方补 currentVersion=1，并按当前配比补建首条版本记录
+        const formulaRows = await tx.table<Formula>('formulas').toArray()
+        const materialRows = await tx.table<Material>('materials').toArray()
+        const materialNameMap = new Map(materialRows.map((material) => [material.id, material.name]))
+        for (const formula of formulaRows) {
+          const proportions = await tx
+            .table<Proportion>('proportions')
+            .where('formulaId')
+            .equals(formula.id)
+            .sortBy('seq')
+          // 仅有配比的香方补建首条版本记录；空方待首次录入配比时再成版
+          if (proportions.length > 0) {
+            const snapshot = proportions.map((proportion) => ({
+              materialId: proportion.materialId,
+              materialName: materialNameMap.get(proportion.materialId) ?? '未知香料',
+              ratio: proportion.ratio,
+              role: proportion.role
+            }))
+            await tx.table<FormulaVersion>('formulaVersions').put({
+              id: createId('fver'),
+              formulaId: formula.id,
+              version: 1,
+              snapshot,
+              changedAt: formula.updatedAt ?? now,
+              changeNote: '建档补版本',
+              basedOn: 0
+            })
+          }
+          await tx.table('formulas').update(formula.id, { currentVersion: 1 })
+        }
+        // 迁移 2：批次补 formulaVersion；缺快照者置为待复核，不自动并入品香均分
+        const batchRows = await tx.table<Batch>('batches').toArray()
+        for (const batch of batchRows) {
+          const patch: Partial<Batch> = {}
+          if (typeof batch.formulaVersion !== 'number') patch.formulaVersion = 1
+          const missingSnapshot = !Array.isArray(batch.snapshot) || batch.snapshot.length === 0
+          patch.reviewState = missingSnapshot ? 'pending' : 'ok'
+          await tx.table('batches').update(batch.id, patch)
+        }
+        // 迁移 3：窖藏补 formulaVersion（取入窖当刻批次版本，缺省 1）
+        for (const batch of batchRows) {
+          const cellarRows = await tx.table<Cellar>('cellars').where('batchId').equals(batch.id).toArray()
+          for (const cellar of cellarRows) {
+            if (typeof cellar.formulaVersion !== 'number') {
+              await tx
+                .table('cellars')
+                .update(cellar.id, { formulaVersion: typeof batch.formulaVersion === 'number' ? batch.formulaVersion : 1 })
+            }
+          }
+        }
+      })
   }
 }
 
@@ -123,7 +190,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.formulaVersions],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,7 +198,8 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.formulaVersions.clear()
       ])
     }
   )
@@ -139,15 +207,16 @@ export async function clearAllTables(): Promise<void> {
 
 /** 各表记录数汇总，品香页与状态徽标消费 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, formulaVersions] = await Promise.all([
     db.formulas.count(),
     db.materials.count(),
     db.proportions.count(),
     db.batches.count(),
     db.cellars.count(),
-    db.tastings.count()
+    db.tastings.count(),
+    db.formulaVersions.count()
   ])
-  return { formulas, materials, proportions, batches, cellars, tastings }
+  return { formulas, materials, proportions, batches, cellars, tastings, formulaVersions }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -192,13 +261,14 @@ export function readLastBackupAt(): string | null {
 
 /** 组装本地全部数据的快照对象 */
 export async function exportSnapshot(): Promise<IncenseSnapshot> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, formulaVersions] = await Promise.all([
     db.formulas.toArray(),
     db.materials.toArray(),
     db.proportions.toArray(),
     db.batches.toArray(),
     db.cellars.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.formulaVersions.toArray()
   ])
   return {
     app: 'gbincense',
@@ -209,7 +279,8 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
     proportions,
     batches,
     cellars,
-    tastings
+    tastings,
+    formulaVersions
   }
 }
 
@@ -218,7 +289,7 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.formulaVersions],
     async () => {
       await db.formulas.bulkPut(snapshot.formulas)
       await db.materials.bulkPut(snapshot.materials)
@@ -226,6 +297,7 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
       await db.batches.bulkPut(snapshot.batches)
       await db.cellars.bulkPut(snapshot.cellars)
       await db.tastings.bulkPut(snapshot.tastings)
+      await db.formulaVersions.bulkPut(snapshot.formulaVersions ?? [])
     }
   )
 }
@@ -250,7 +322,9 @@ const SEED_IDS = {
   cellarLine: 'seed_cellar_line',
   cellarPill: 'seed_cellar_pill',
   tastingLine: 'seed_tasting_line',
-  tastingPill: 'seed_tasting_pill'
+  tastingPill: 'seed_tasting_pill',
+  versionLine: 'seed_version_line',
+  versionPill: 'seed_version_pill'
 } as const
 
 /**
@@ -280,6 +354,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-03-12',
       totalRatio: 100,
       state: '在用',
+      currentVersion: 1,
       updatedAt: now
     },
     {
@@ -290,6 +365,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-05-08',
       totalRatio: 100,
       state: '在用',
+      currentVersion: 1,
       updatedAt: now
     },
     {
@@ -300,6 +376,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-08-21',
       totalRatio: 0,
       state: '草稿',
+      currentVersion: 1,
       updatedAt: now
     }
   ]
@@ -389,6 +466,8 @@ export async function seedDatabase(): Promise<void> {
       operator: '林砚舟',
       snapshot: toSnapshot(lineRatio),
       snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      formulaVersion: 1,
+      reviewState: 'ok',
       updatedAt: now
     },
     {
@@ -400,6 +479,8 @@ export async function seedDatabase(): Promise<void> {
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
       snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      formulaVersion: 1,
+      reviewState: 'ok',
       updatedAt: now
     }
   ]
@@ -414,6 +495,7 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
+      formulaVersion: 1,
       updatedAt: now
     },
     {
@@ -425,6 +507,7 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 62,
       container: '锡罐',
       state: '已出窖',
+      formulaVersion: 1,
       updatedAt: now
     }
   ]
@@ -452,9 +535,30 @@ export async function seedDatabase(): Promise<void> {
     }
   ]
 
+  const formulaVersions: FormulaVersion[] = [
+    {
+      id: SEED_IDS.versionLine,
+      formulaId: SEED_IDS.formulaLine,
+      version: 1,
+      snapshot: toSnapshot(lineRatio),
+      changedAt: new Date('2024-03-12T09:00:00').getTime(),
+      changeNote: '建档补版本',
+      basedOn: 0
+    },
+    {
+      id: SEED_IDS.versionPill,
+      formulaId: SEED_IDS.formulaPill,
+      version: 1,
+      snapshot: toSnapshot(pillRatio),
+      changedAt: new Date('2024-05-08T09:00:00').getTime(),
+      changeNote: '建档补版本',
+      basedOn: 0
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.formulaVersions],
     async () => {
       await db.formulas.bulkPut(formulas)
       await db.materials.bulkPut(materials)
@@ -462,6 +566,7 @@ export async function seedDatabase(): Promise<void> {
       await db.batches.bulkPut(batches)
       await db.cellars.bulkPut(cellars)
       await db.tastings.bulkPut(tastings)
+      await db.formulaVersions.bulkPut(formulaVersions)
     }
   )
 }

@@ -13,6 +13,8 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
+import { checkBatchSnapshot, formatDiffItem, formatDiffSummary } from '@/utils/version'
+import type { SnapshotDiff } from '@/types/version'
 import {
   CELLAR_CONTAINERS,
   CELLAR_NEAR_DAYS,
@@ -38,6 +40,16 @@ const dialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
+
+/** 入窖前快照比对差异对话框 */
+const diffVisible = ref(false)
+const diffData = ref<{
+  diff: SnapshotDiff
+  batchLabel: string
+  currentVersion: number
+  batchVersion: number
+  pendingReview: boolean
+} | null>(null)
 
 
 const form = reactive<{
@@ -274,18 +286,37 @@ async function submitForm(): Promise<void> {
         state: form.state
       })
       ElMessage.success('窖藏环境记录已更新')
-    } else {
-      await cellarStore.createCellar({
-        batchId: form.batchId,
-        startDate: form.startDate,
-        endDate: form.endDate,
-        temperatureC: form.temperatureC,
-        humidityPct: form.humidityPct,
-        container: form.container,
-        state: form.state
-      })
-      ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+      dialogVisible.value = false
+      return
     }
+
+    // 入窖前比对：批次快照必须与香方当前配比一致，否则拒绝入窖并列出香料差异
+    const check = await checkBatchSnapshot(form.batchId)
+    if (!check.matched) {
+      const batch = batchTable.rows.value.find((item) => item.id === form.batchId)
+      const formula = batch ? formulaStore.formulaById(batch.formulaId) : null
+      diffData.value = {
+        diff: check.diff,
+        batchLabel: `${formula?.name ?? '香方已删除'} · ${batch?.mixedAt ?? ''}`,
+        currentVersion: check.currentVersion,
+        batchVersion: check.batchVersion,
+        pendingReview: check.pendingReview
+      }
+      diffVisible.value = true
+      return
+    }
+
+    await cellarStore.createCellar({
+      batchId: form.batchId,
+      startDate: form.startDate,
+      endDate: form.endDate,
+      temperatureC: form.temperatureC,
+      humidityPct: form.humidityPct,
+      container: form.container,
+      state: form.state,
+      formulaVersion: check.currentVersion
+    })
+    ElMessage.success('已登记窖藏批次，快照已冻结，临近出窖会自动提醒')
     dialogVisible.value = false
   } finally {
     submitting.value = false
@@ -431,9 +462,12 @@ const formingText = (batchId: string): FormingMethod | '—' =>
       </div>
 
       <el-table v-else :data="rows" row-key="cellar.id" stripe>
-        <el-table-column label="批次 / 香方" min-width="210">
+        <el-table-column label="批次 / 香方" min-width="230">
           <template #default="{ row }: { row: CellarRow }">
-            <div class="cell-main">{{ row.formulaName }}</div>
+            <div class="cell-main">
+              {{ row.formulaName }}
+              <el-tag size="small" effect="plain" round class="version-tag">冻结 v{{ row.cellar.formulaVersion ?? 1 }}</el-tag>
+            </div>
             <div class="cell-sub muted">
               {{ formingText(row.cellar.batchId) }} · {{ row.quantity }} 支 · 配比
               {{ batchFormulaMaterialCount(row.cellar.batchId) }} 味
@@ -579,6 +613,44 @@ const formingText = (batchId: string): FormingMethod | '—' =>
         </el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="diffVisible" title="入窖校验未通过：快照与当前配比不一致" width="620px" append-to-body>
+      <template v-if="diffData">
+        <el-alert
+          type="error"
+          :closable="false"
+          show-icon
+          :title="diffData.pendingReview ? '该批次缺快照、待复核，暂不能入窖' : '批次快照已落后于当前配比，拒绝入窖'"
+          :description="`${diffData.batchLabel} · 快照 v${diffData.batchVersion}，当前方 v${diffData.currentVersion}`"
+        />
+        <p class="diff-summary">差异汇总：{{ formatDiffSummary(diffData.diff) }}</p>
+        <el-table :data="diffData.diff.added.concat(diffData.diff.removed, diffData.diff.changed)" size="small" row-key="materialId" max-height="320">
+          <el-table-column label="香料" prop="materialName" min-width="140" />
+          <el-table-column label="类型" width="90">
+            <template #default="{ row }">
+              <el-tag
+                size="small"
+                :type="row.kind === 'added' ? 'success' : row.kind === 'removed' ? 'danger' : 'warning'"
+                effect="plain"
+              >
+                {{ row.kind === 'added' ? '新增' : row.kind === 'removed' ? '移除' : '变化' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="差异说明" min-width="260">
+            <template #default="{ row }">
+              <span class="cell-sub">{{ formatDiffItem(row) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p class="muted diff-hint">
+          请先到「和香批次」页对该批次「补快照复核」（未入窖批次会随配比重算），或回到配比页恢复配比后再入窖。
+        </p>
+      </template>
+      <template #footer>
+        <el-button @click="diffVisible = false">知道了</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -621,5 +693,17 @@ const formingText = (batchId: string): FormingMethod | '—' =>
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.diff-summary {
+  margin: 12px 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.diff-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

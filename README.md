@@ -112,23 +112,25 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
-| `formulas` | `id, name, scentType, usage, state, createdAt, totalRatio, updatedAt` | 香方主档，`totalRatio` 由配比页实时回写 |
+| `formulas` | `id, name, scentType, usage, state, createdAt, totalRatio, currentVersion, updatedAt` | 香方主档，`currentVersion` 为当前版本号 |
 | `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式 |
 | `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序 |
-| `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照 |
-| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
+| `batches` | `id, formulaId, mixedAt, formingMethod, formulaVersion, reviewState, updatedAt` | 和香批次，含 `snapshot` 配比快照、`formulaVersion` 快照版本、`reviewState` 复核状态 |
+| `cellars` | `id, batchId, startDate, endDate, state, formulaVersion, updatedAt` | 窖藏批次与环境读数，`formulaVersion` 为入窖当刻冻结版本 |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
+| `formulaVersions` | `id, formulaId, version, changedAt` | 香方版本链，每条记录固化该版配比快照 |
 
-- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
-  1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；
-  2. 批次表补齐 `snapshot` 数组与 `snapshotAt`；
-  3. 品香表补齐 `lastingMin` 默认值。
-- **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
-- **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）。
+- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(2)` 补 `seq` 索引并回填历史脏数据；`version(DB_VERSION)` 建立版本链并回填历史档案：
+  1. 为每款香方补 `currentVersion=1`，并按当前配比补建首条版本记录（无配比的空方待首次录入时成版）；
+  2. 批次补 `formulaVersion`，缺快照者置 `reviewState='pending'`（待复核，不并入品香均分）；
+  3. 窖藏补 `formulaVersion`（取入窖当刻批次版本）。
+- **版本链联动规则**（`utils/version.ts`）：配比每调整一次 → `bumpFormulaVersion()` 递增香方版本并写入新版本记录 → **未入窖批次**快照立即失效并重算到新版本，**已入窖批次**冻结原快照与版本号。入窖前 `checkBatchSnapshot()` 逐味比对批次快照与当前配比，不一致则拒绝入窖并列出香料差异。缺快照的旧批次可在批次页「补快照复核」。
+- **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香 / 2 条版本记录（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
+- **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）、`gbincense:draft:formula:<id>`（香方编辑冲突草稿）。
 - **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库。
 - **无命名卷、无后端**：数据只在本浏览器，清理浏览器站点数据即清空；应用内提供「重置演示数据」按钮可恢复样例档案。
 

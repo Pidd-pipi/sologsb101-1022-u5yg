@@ -15,6 +15,7 @@ import {
   scaleRatios,
   sortByRoleWeight
 } from '@/utils/ratio'
+import { bumpFormulaVersion } from '@/utils/version'
 
 export interface UseProportionOptions {
   /** 仅在该香方下操作；不传则使用 formulaStore 的当前香方 */
@@ -152,6 +153,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
         seq: nextSeq(id)
       })
       await syncFormulaTotal()
+      await bumpFormulaVersion(id, '新增配比')
       return record
     } catch (err) {
       error.value = err instanceof Error ? err.message : '新增配比失败'
@@ -162,6 +164,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   }
 
   async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<void> {
+    const fid = formulaId.value
     loading.value = true
     try {
       const next: Partial<Proportion> = {}
@@ -171,6 +174,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       if (patch.note !== undefined) next.note = patch.note.trim()
       await proportionStore.updateProportion(id, next)
       await syncFormulaTotal()
+      if (fid) await bumpFormulaVersion(fid, '配比调整')
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'
       throw err
@@ -180,8 +184,10 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   }
 
   async function remove(id: string): Promise<void> {
+    const fid = formulaId.value
     await proportionStore.removeProportion(id)
     await syncFormulaTotal()
+    if (fid) await bumpFormulaVersion(fid, '移除配比')
   }
 
   async function writeRatios(ids: string[], ratios: number[]): Promise<void> {
@@ -196,6 +202,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   /** 等比缩放：按 factor 缩放全部占比后归一化到 100 并写回 */
   async function rescale(factor = 1): Promise<number> {
     const list = rows.value
+    const fid = formulaId.value
     if (list.length === 0) return 0
     const scaled =
       factor === 1
@@ -206,6 +213,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       scaled
     )
     await syncFormulaTotal()
+    if (fid) await bumpFormulaVersion(fid, factor === 1 ? '归一化配比' : '等比缩放配比')
     return scaled.length
   }
 
@@ -242,6 +250,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     if (!id) return 0
     const count = await proportionStore.clearFormulaProportions(id)
     await syncFormulaTotal()
+    await bumpFormulaVersion(id, '清空配比')
     return count
   }
 
